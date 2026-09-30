@@ -1,0 +1,74 @@
+# GitHub Actions schedule for the Roblox Trend Database collector.
+# Lives at .github/workflows/collector.yml in the repository.
+# Times are UTC. GitHub runs schedules approximately (often 5–15 minutes late), which is fine here.
+
+name: rtdb collector
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # stats, every 30 minutes
+    - cron: "7 * * * *"      # sorts + promote, hourly
+    - cron: "20 3 * * *"     # daily refresh
+    - cron: "0 12 * * 0"     # weekly heartbeat commit (keeps the schedule from being paused)
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Collector job to run by hand"
+        type: choice
+        default: stats
+        options: [stats, sorts, promote, daily, sample-controls, probe]
+
+permissions:
+  contents: write            # only used by the heartbeat commit
+
+# Never stack two copies of the same schedule; different schedules may overlap (they run on different machines).
+concurrency:
+  group: rtdb-${{ github.event.schedule || inputs.job }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      RTDB_CONTACT: ${{ secrets.RTDB_CONTACT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: github.event.schedule != '0 12 * * 0'
+        run: pip install -r requirements.txt
+
+      - name: stats (every 30 min)
+        if: github.event.schedule == '*/30 * * * *' || inputs.job == 'stats'
+        run: python collector.py stats
+
+      - name: sorts + promote (hourly)
+        if: github.event.schedule == '7 * * * *' || inputs.job == 'sorts'
+        run: |
+          python collector.py sorts
+          python collector.py promote
+
+      - name: daily refresh
+        if: github.event.schedule == '20 3 * * *' || inputs.job == 'daily'
+        run: python collector.py daily
+
+      - name: other manual jobs
+        if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["promote","sample-controls","probe"]'), inputs.job)
+        run: python collector.py ${{ inputs.job }}
+
+      - name: weekly heartbeat commit
+        if: github.event.schedule == '0 12 * * 0'
+        run: |
+          git config user.name "rtdb-bot"
+          git config user.email "rtdb-bot@users.noreply.github.com"
+          date -u > heartbeat.txt
+          git add heartbeat.txt
+          git commit -m "heartbeat: keep the schedule active" || exit 0
+          git push
