@@ -58,6 +58,59 @@ jobs:
         if: github.event.schedule != '0 12 * * 0'
         run: pip install -r requirements.txt
 
+      - name: Write the report-publishing helper (self-contained; nothing to upload)
+        run: |
+          cat > ./publish_reports.sh <<'PUBLISH_EOF'
+          #!/usr/bin/env bash
+          # publish_reports.sh <label> — push everything in reports/ to the private reports repository when
+          # REPORTS_REPO (owner/name) and REPORTS_TOKEN (fine-grained PAT, Contents: read/write) are set;
+          # otherwise commit reports/ into this repository. Also maintains reports/README.md as an index.
+          set -e
+          LABEL="${1:-reports}"
+          ls reports/*.md >/dev/null 2>&1 || { echo "no reports to publish"; exit 0; }
+
+          make_index() {
+          python3 - "$1" <<'PY'
+          import os, sys, glob
+          d = sys.argv[1]
+          def section(title, pattern):
+              files = sorted(glob.glob(os.path.join(d, pattern)), reverse=True)
+              out = [f"## {title}", ""]
+              out += [f"- [{os.path.basename(f)}]({os.path.basename(f)})" for f in files[:60]] or ["- none yet"]
+              return out + [""]
+          lines = ["# rtdb reports", "", "Newest first. Opportunity reports are design briefs for the best-scoring archetypes; radar reports are daily briefs on games that ignited.", ""]
+          lines += section("Opportunities", "opportunities-*.md") + section("Radar", "radar-*.md")
+          open(os.path.join(d, "README.md"), "w", encoding="utf-8").write("\n".join(lines))
+          PY
+          }
+
+          git config user.name "rtdb-bot"
+          git config user.email "rtdb-bot@users.noreply.github.com"
+
+          if [ -n "$REPORTS_REPO" ] && [ -n "$REPORTS_TOKEN" ]; then
+            rm -rf _reports
+            git clone --quiet --depth 1 "https://x-access-token:${REPORTS_TOKEN}@github.com/${REPORTS_REPO}.git" _reports
+            mkdir -p _reports/reports
+            cp reports/*.md _reports/reports/
+            make_index _reports/reports
+            cd _reports
+            git config user.name "rtdb-bot"
+            git config user.email "rtdb-bot@users.noreply.github.com"
+            git add reports
+            git commit -m "${LABEL}: $(date -u +%F)" || { echo "nothing new"; exit 0; }
+            git push --quiet
+            echo "published to private repo ${REPORTS_REPO}"
+          else
+            make_index reports
+            git add reports
+            git commit -m "${LABEL}: $(date -u +%F)" || { echo "nothing new"; exit 0; }
+            git pull --rebase --autostash origin main || true
+            git push
+            echo "committed to this repository (set REPORTS_REPO + REPORTS_TOKEN secrets to publish privately)"
+          fi
+          PUBLISH_EOF
+          chmod +x ./publish_reports.sh
+
       - name: stats (every 30 min)
         if: github.event.schedule == '*/30 * * * *' || inputs.job == 'stats'
         run: python collector.py stats
@@ -87,14 +140,14 @@ jobs:
         run: |
           set -e
           python radar.py run --n "$RTDB_RADAR_N" --model "$RTDB_RADAR_MODEL"
-          bash publish_reports.sh radar
+          bash ./publish_reports.sh radar
 
       - name: opportunity engine
         if: github.event.schedule == '30 15 * * 1' || inputs.job == 'opportunity'
         run: |
           set -e
           python opportunity.py run --top "$RTDB_OPP_TOP"
-          bash publish_reports.sh opportunities
+          bash ./publish_reports.sh opportunities
 
       - name: remove reports from this (public) repository
         if: inputs.job == 'purge-public-reports'
