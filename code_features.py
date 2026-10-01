@@ -10,7 +10,7 @@ remainder that still needs a human.
       markers, description traits, game-pass scaffold, server size, age rating, genre, update
       frequency, creator traits). Free, takes seconds, safe to re-run: only changed values are written.
 
-  python code_features.py llm [--limit 200] [--recode] [--missing KEY] [--no-vision] [--dry-run] [--model ID]
+  python code_features.py llm [--limit 200] [--recode] [--missing KEY] [--refine KEY] [--no-vision] [--dry-run] [--model ID]
       Asks Claude to infer the design traits that can be read from a game's page: core loop,
       session shape, progression, social mechanics, risk, timers, borrowed IP, and the icon traits
       (from the icon image). Each answer is stored with a confidence and a one-line rationale.
@@ -267,8 +267,9 @@ def auto_rows_for(r: tuple) -> list[tuple]:
         (uid, "server_size", None, max_players, None),
         (uid, "age_rating", age_enum(age), None, f"label={age!r}"),
         (uid, "creator_is_group", bool_text(ctype == "Group"), None, None),
-        (uid, "creator_prior_peak_ccu", None, int(prior_peak or 0), None if prior_peak else "no earlier experience by this creator in the database"),
     ]
+    if prior_peak is not None:
+        rows.append((uid, "creator_prior_peak_ccu", None, int(prior_peak), None))
     if pass_count:
         names = pass_names or ""
         rows += [
@@ -348,8 +349,11 @@ LEFT JOIN changed ch USING (universe_id)
 WHERE e.tracking_tier <> 'paused'
   AND (ll.coded_at IS NULL
        OR (%(recode)s AND ch.changed_at > ll.coded_at + interval '1 hour')
-       OR (%(missing)s::text IS NOT NULL AND NOT EXISTS (SELECT 1 FROM feature f WHERE f.universe_id = e.universe_id AND f.feature_key = %(missing)s::text)))
-ORDER BY CASE t.tier WHEN 'breakout' THEN 0 WHEN 'hit' THEN 1 WHEN 'mid' THEN 2 ELSE 3 END,
+       OR (%(missing)s::text IS NOT NULL AND NOT EXISTS (SELECT 1 FROM feature f WHERE f.universe_id = e.universe_id AND f.feature_key = %(missing)s::text))
+       OR (%(refine)s::text IS NOT NULL AND EXISTS (SELECT 1 FROM v_feature_latest fl WHERE fl.universe_id = e.universe_id AND fl.feature_key = %(refine)s::text AND fl.value_text = 'other')))
+ORDER BY CASE WHEN %(refine)s::text IS NOT NULL AND EXISTS (SELECT 1 FROM v_feature_latest fl WHERE fl.universe_id = e.universe_id
+                                                              AND fl.feature_key = %(refine)s::text AND fl.value_text = 'other') THEN 0 ELSE 1 END,
+         CASE t.tier WHEN 'breakout' THEN 0 WHEN 'hit' THEN 1 WHEN 'mid' THEN 2 ELSE 3 END,
          CASE WHEN e.population = 'control' THEN 0 ELSE 1 END,
          t.peak_max_ccu DESC NULLS LAST
 LIMIT %(limit)s
@@ -430,7 +434,9 @@ def call_claude(http: C.Http, api_key: str, model: str, prompt: str, icon: tuple
         if r.status_code == 200:
             data = r.json()
             text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-            return text, data.get("usage", {})
+            usage = dict(data.get("usage", {}))
+            usage["stop_reason"] = data.get("stop_reason")
+            return text, usage
         if r.status_code in (429, 500, 502, 503, 529):
             delay = min(60, 5 * 2**attempt)
             log.warning("Anthropic API %s; retrying in %ds", r.status_code, delay)
@@ -440,11 +446,49 @@ def call_claude(http: C.Http, api_key: str, model: str, prompt: str, icon: tuple
     raise RuntimeError("Anthropic API: gave up after retries")
 
 
+def extract_json(text: str) -> dict:
+    """Pull the first complete JSON object out of a reply that may carry prose or code fences."""
+    cleaned = re.sub(r"^```(?:json)?|```$", "", (text or "").strip(), flags=re.M).strip()
+    start = cleaned.find("{")
+    if start < 0:
+        raise ValueError("no JSON object in reply" + (" (empty reply — likely cut off by the token budget)" if not cleaned else ""))
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(cleaned)):
+        ch = cleaned[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(cleaned[start:i + 1])
+    raise ValueError("JSON object is incomplete (reply cut off by the token budget)")
+
+
+def ask_json(http: C.Http, api_key: str, model: str, prompt: str, icon, system: str | None, max_tokens: int) -> tuple[dict, dict]:
+    """Call Claude and parse its JSON reply; if the reply was truncated, retry once with double the budget."""
+    text, usage = call_claude(http, api_key, model, prompt, icon, system=system, max_tokens=max_tokens)
+    if usage.get("stop_reason") == "max_tokens":
+        log.info("reply hit the %d-token budget; retrying with %d", max_tokens, max_tokens * 2)
+        text, usage2 = call_claude(http, api_key, model, prompt, icon, system=system, max_tokens=max_tokens * 2)
+        for k in ("input_tokens", "output_tokens"):
+            usage2[k] = int(usage.get(k, 0)) + int(usage2.get(k, 0))
+        usage = usage2
+    return extract_json(text), usage
+
+
 def parse_answer(text: str, codebook: dict, fields: list[str]) -> tuple[list[tuple], list[str]]:
     """Returns (rows without universe_id: (feature_key, value_text, value_num, evidence), low_confidence_fields)."""
-    cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    obj = json.loads(cleaned[start:end + 1])
+    obj = text if isinstance(text, dict) else extract_json(text)
     rows, low = [], []
     for f in fields:
         item = obj.get(f)
@@ -487,7 +531,7 @@ def parse_answer(text: str, codebook: dict, fields: list[str]) -> tuple[list[tup
     return rows, low
 
 
-def job_llm(db: Db, limit: int, recode: bool, vision: bool, dry_run: bool, model: str, missing: str | None = None) -> int:
+def job_llm(db: Db, limit: int, recode: bool, vision: bool, dry_run: bool, model: str, missing: str | None = None, refine: str | None = None) -> int:
     conn = db.conn
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -495,7 +539,7 @@ def job_llm(db: Db, limit: int, recode: bool, vision: bool, dry_run: bool, model
         return 0
     codebook = load_codebook(conn)
     with conn.cursor() as cur:
-        cur.execute(LLM_SQL, {"recode": recode, "limit": limit, "missing": missing})
+        cur.execute(LLM_SQL, {"recode": recode, "limit": limit, "missing": missing, "refine": refine})
         games = cur.fetchall()
     if not games:
         log.info("llm: nothing to code (every game is already coded; use --recode to refresh changed games)")
@@ -509,8 +553,9 @@ def job_llm(db: Db, limit: int, recode: bool, vision: bool, dry_run: bool, model
         fields = LLM_FIELDS + (ICON_FIELDS if icon else [])
         prompt = build_prompt(codebook, g, with_icon=bool(icon))
         try:
-            text, usage = call_claude(http, api_key, model, prompt, icon)
-            rows, low = parse_answer(text, codebook, fields)
+            obj, usage = ask_json(http, api_key, model, prompt, icon, system=SYSTEM_PROMPT, max_tokens=4000)
+            rows, low = parse_answer(obj, codebook, fields)
+            text = json.dumps(obj)
         except Exception as e:
             log.warning("llm: %s (%s) failed: %s", name, uid, e)
             continue
@@ -649,6 +694,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--limit", type=int, default=200, help="llm: max games per run")
     ap.add_argument("--recode", action="store_true", help="llm: also refresh games whose page changed since coding")
     ap.add_argument("--missing", default=None, help="llm: also code games that lack this trait, e.g. --missing play_mode")
+    ap.add_argument("--refine", default=None, help="llm: also re-code games whose value for this trait is 'other', e.g. --refine core_loop")
     ap.add_argument("--no-vision", action="store_true", help="llm: skip the icon image")
     ap.add_argument("--dry-run", action="store_true", help="llm: print one prompt and answer, write nothing")
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"llm: model id (default {DEFAULT_MODEL})")
@@ -675,7 +721,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.job == "auto":
             db.retry(job_auto)
         elif args.job == "llm":
-            job_llm(db, args.limit, args.recode, not args.no_vision, args.dry_run, args.model, args.missing)
+            job_llm(db, args.limit, args.recode, not args.no_vision, args.dry_run, args.model, args.missing, args.refine)
         elif args.job == "queue":
             db.retry(job_queue, args.n, args.out)
         else:

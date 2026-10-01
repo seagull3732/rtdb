@@ -1,5 +1,5 @@
 -- =============================================================================
---  Roblox Trend Database (rtdb) — schema v0.5  (re-running this file is safe)
+--  Roblox Trend Database (rtdb) — schema v0.6  (re-running this file is safe)
 --  Target: PostgreSQL 14+ (Supabase free tier is fine). Apply with:
 --      psql "$DATABASE_URL" -f schema.sql        or        python collector.py init
 --  Design rules:
@@ -497,6 +497,12 @@ INSERT INTO codebook (feature_key, family, value_type, definition, allowed_value
  ('play_mode','play','multi','How players relate to the game and each other: all that apply.','pve|pvp|coop|social|party|trading|roleplay|creative')
 ON CONFLICT (feature_key) DO NOTHING;
 
+-- core_loop vocabulary v2: the first pass left 27% of games as 'other'; these cover the common Roblox loops.
+UPDATE codebook SET allowed_values =
+  'collect|grow|steal|tycoon|obby|horror|round_pvp|roleplay|idle|rng|sports|shooter|fighting|survival|tower_defense|vehicle_sim|sandbox_physics|build_craft|dress_up|rhythm|puzzle|hangout|racing|other',
+  version = 'v2'
+WHERE feature_key = 'core_loop' AND version <> 'v2';
+
 -- One primary category per game, derived from play_mode, then core_loop, then Roblox's own genre.
 CREATE OR REPLACE VIEW v_category AS
 WITH f AS (
@@ -517,9 +523,11 @@ SELECT e.universe_id, e.name, e.genre_l1, e.genre_l2, f.play_mode, f.core_loop,
          WHEN f.play_mode LIKE '%roleplay%' THEN 'Roleplay'
          WHEN f.play_mode LIKE '%creative%' THEN 'Creative'
          WHEN f.play_mode LIKE '%pve%'      THEN 'PvE'
-         WHEN f.core_loop IN ('round_pvp','shooter','sports','steal') THEN 'PvP'
-         WHEN f.core_loop IN ('roleplay')                            THEN 'Roleplay'
-         WHEN f.core_loop IN ('collect','grow','tycoon','idle','rng','obby','horror') THEN 'PvE'
+         WHEN f.core_loop IN ('round_pvp','shooter','sports','steal','fighting','racing') THEN 'PvP'
+         WHEN f.core_loop IN ('roleplay','dress_up')                 THEN 'Roleplay'
+         WHEN f.core_loop IN ('hangout')                             THEN 'Social'
+         WHEN f.core_loop IN ('build_craft','sandbox_physics')       THEN 'Creative'
+         WHEN f.core_loop IN ('collect','grow','tycoon','idle','rng','obby','horror','survival','tower_defense','vehicle_sim','rhythm','puzzle') THEN 'PvE'
          WHEN e.genre_l1 ILIKE '%roleplay%' OR e.genre_l1 ILIKE '%avatar%' THEN 'Roleplay'
          WHEN e.genre_l1 ILIKE '%party%'   THEN 'Party'
          WHEN e.genre_l1 ILIKE '%shooter%' OR e.genre_l1 ILIKE '%sports%' OR e.genre_l1 ILIKE '%action%' THEN 'PvP'
@@ -536,7 +544,8 @@ WITH w AS (
            avg(playing) FILTER (WHERE ts BETWEEN now() - interval '48 hours' AND now() - interval '24 hours')             AS ccu_prev_24h,
            avg(playing) FILTER (WHERE ts BETWEEN now() - interval '8 days'   AND now() - interval '7 days')               AS ccu_7d_ago,
            avg(playing) FILTER (WHERE ts BETWEEN now() - interval '29 days'  AND now() - interval '28 days')              AS ccu_28d_ago,
-           max(playing) FILTER (WHERE ts > now() - interval '7 days')                                                     AS peak_7d
+           max(playing) FILTER (WHERE ts > now() - interval '7 days')                                                     AS peak_7d,
+           avg(playing) FILTER (WHERE ts > now() - interval '6 hours')                                                    AS ccu_6h
     FROM snapshot
     WHERE ts > now() - interval '29 days' AND playing IS NOT NULL
     GROUP BY universe_id
@@ -562,7 +571,9 @@ SELECT e.universe_id, e.name,
             WHEN w.ccu_24h / NULLIF(w.ccu_7d_ago, 0) - 1 >  0.10 THEN 'growing'
             WHEN w.ccu_24h / NULLIF(w.ccu_7d_ago, 0) - 1 > -0.10 THEN 'flat'
             WHEN w.ccu_24h / NULLIF(w.ccu_7d_ago, 0) - 1 > -0.40 THEN 'declining'
-            ELSE 'collapsing' END                                         AS velocity_label
+            ELSE 'collapsing' END                                         AS velocity_label,
+       round(w.ccu_6h)::int                                              AS ccu_6h,
+       (w.ccu_6h / NULLIF(w.ccu_24h, 0))::numeric(6,2)                    AS momentum          -- <1 = fading within the day
 FROM experience e
 JOIN w USING (universe_id)
 LEFT JOIN r USING (universe_id);
@@ -696,6 +707,7 @@ CREATE TABLE IF NOT EXISTS radar_report (
 );
 
 -- Who is igniting right now, why they tripped the radar, and a heat score to rank them.
+-- "First time" triggers only count for games we have watched for 7+ days, or genuinely new games (created < 60 days ago).
 CREATE OR REPLACE VIEW v_radar_candidates AS
 WITH first_major AS (
     SELECT universe_id, min(ts) AS first_on_major
@@ -709,34 +721,44 @@ milestones AS (
            max(playing) FILTER (WHERE ts <= now() - interval '24 hours') AS max_before
     FROM snapshot GROUP BY universe_id
 ),
-alerts AS (SELECT DISTINCT universe_id FROM v_growth_alerts)
-SELECT e.universe_id, e.name, e.created_at,
-       v.ccu_24h, v.growth_1d, v.growth_7d, v.growth_28d, v.trending_rank_now, v.trending_rank_climb, v.velocity_label,
+alerts AS (SELECT DISTINCT universe_id FROM v_growth_alerts),
+base AS (
+    SELECT e.universe_id, e.name, e.created_at, v.ccu_24h, v.growth_1d, v.growth_7d, v.growth_28d,
+           v.trending_rank_now, v.trending_rank_climb, v.velocity_label, v.momentum,
+           (e.first_seen_at < now() - interval '7 days' OR e.created_at > now() - interval '60 days') AS history_ok,
+           (a.universe_id IS NOT NULL)                                                   AS t_alert,
+           (f.first_on_major > now() - interval '24 hours'
+              AND (e.first_seen_at < now() - interval '3 days' OR e.created_at > now() - interval '60 days')) AS t_chart,
+           (v.trending_rank_climb >= 20)                                                 AS t_climb,
+           (v.growth_7d >= 1.0 AND v.ccu_24h >= 1000)                                    AS t_double,
+           CASE WHEN m.max_24h >= 50000 AND coalesce(m.max_before, 0) < 50000 THEN 50000
+                WHEN m.max_24h >= 10000 AND coalesce(m.max_before, 0) < 10000 THEN 10000
+                WHEN m.max_24h >=  2000 AND coalesce(m.max_before, 0) <  2000 THEN  2000 END AS milestone
+    FROM experience e
+    JOIN v_velocity v USING (universe_id)
+    LEFT JOIN alerts a USING (universe_id)
+    LEFT JOIN first_major f USING (universe_id)
+    LEFT JOIN milestones m USING (universe_id)
+    WHERE e.tracking_tier <> 'paused'
+)
+SELECT universe_id, name, created_at, ccu_24h, growth_1d, growth_7d, growth_28d, trending_rank_now, trending_rank_climb, velocity_label,
        array_remove(ARRAY[
-           CASE WHEN a.universe_id IS NOT NULL                                   THEN 'growth alert: daily players up 50%+ day-over-day' END,
-           CASE WHEN f.first_on_major > now() - interval '24 hours'               THEN 'new to a major chart (top 100) in the last 24h' END,
-           CASE WHEN v.trending_rank_climb >= 20                                  THEN 'climbed 20+ places on Top Trending this week' END,
-           CASE WHEN v.growth_7d >= 1.0 AND v.ccu_24h >= 1000                     THEN 'doubled players in 7 days' END,
-           CASE WHEN m.max_24h >= 50000 AND coalesce(m.max_before, 0) < 50000     THEN 'crossed 50k players for the first time'
-                WHEN m.max_24h >= 10000 AND coalesce(m.max_before, 0) < 10000     THEN 'crossed 10k players for the first time'
-                WHEN m.max_24h >=  2000 AND coalesce(m.max_before, 0) <  2000     THEN 'crossed 2k players for the first time' END
+           CASE WHEN t_alert                       THEN 'growth alert: daily players up 50%+ day-over-day' END,
+           CASE WHEN t_chart                       THEN 'new to a major chart (top 100) in the last 24h' END,
+           CASE WHEN t_climb                       THEN 'climbed 20+ places on Top Trending this week' END,
+           CASE WHEN t_double                      THEN 'doubled players in 7 days' END,
+           CASE WHEN history_ok AND milestone IS NOT NULL THEN 'crossed ' || (milestone / 1000) || 'k players for the first time' END
        ], NULL) AS triggers,
-       (ln(greatest(coalesce(v.ccu_24h, 1), 1))
-          * (1 + coalesce(greatest(v.growth_7d, 0), 0) + 0.5 * coalesce(greatest(v.growth_1d, 0), 0))
-        + CASE WHEN f.first_on_major > now() - interval '24 hours' THEN 3 ELSE 0 END
-        + coalesce(greatest(v.trending_rank_climb, 0), 0) / 10.0
-        + CASE WHEN a.universe_id IS NOT NULL THEN 2 ELSE 0 END)::numeric(8,2) AS heat
-FROM experience e
-JOIN v_velocity v USING (universe_id)
-LEFT JOIN alerts a USING (universe_id)
-LEFT JOIN first_major f USING (universe_id)
-LEFT JOIN milestones m USING (universe_id)
-WHERE e.tracking_tier <> 'paused'
-  AND (a.universe_id IS NOT NULL
-       OR f.first_on_major > now() - interval '24 hours'
-       OR v.trending_rank_climb >= 20
-       OR (v.growth_7d >= 1.0 AND v.ccu_24h >= 1000)
-       OR (m.max_24h >= 2000 AND coalesce(m.max_before, 0) < 2000))
+       (ln(greatest(coalesce(ccu_24h, 1), 1))
+          * (1 + least(coalesce(greatest(growth_7d, 0), 0), 3) + 0.5 * least(coalesce(greatest(growth_1d, 0), 0), 3))
+          * least(1.0, coalesce(momentum, 1) + 0.25)                       -- a spike that is already fading ranks lower
+        + CASE WHEN t_chart THEN 3 ELSE 0 END
+        + least(coalesce(greatest(trending_rank_climb, 0), 0), 50) / 10.0
+        + CASE WHEN t_alert THEN 2 ELSE 0 END)::numeric(8,2) AS heat,
+       momentum
+FROM base
+WHERE (t_alert OR t_chart OR t_climb OR t_double OR (history_ok AND milestone IS NOT NULL))
+  AND coalesce(momentum, 1) >= 0.4                                        -- skip spikes that are already over
 ORDER BY heat DESC;
 
 COMMIT;
