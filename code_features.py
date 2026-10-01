@@ -418,12 +418,12 @@ def fetch_icon_b64(http: C.Http, url: str | None) -> tuple[str, str] | None:
     return mt, base64.b64encode(data).decode("ascii")
 
 
-def call_claude(http: C.Http, api_key: str, model: str, prompt: str, icon: tuple[str, str] | None) -> tuple[str, dict]:
+def call_claude(http: C.Http, api_key: str, model: str, prompt: str, icon: tuple[str, str] | None, system: str | None = None, max_tokens: int = 1200) -> tuple[str, dict]:
     content: list[dict] = []
     if icon:
         content.append({"type": "image", "source": {"type": "base64", "media_type": icon[0], "data": icon[1]}})
     content.append({"type": "text", "text": prompt})
-    body = {"model": model, "max_tokens": 1200, "system": SYSTEM_PROMPT, "messages": [{"role": "user", "content": content}]}
+    body = {"model": model, "max_tokens": max_tokens, "system": system or SYSTEM_PROMPT, "messages": [{"role": "user", "content": content}]}
     headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     for attempt in range(6):
         r = http.client.post(ANTHROPIC_URL, headers=headers, json=body, timeout=120)

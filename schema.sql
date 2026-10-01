@@ -1,5 +1,5 @@
 -- =============================================================================
---  Roblox Trend Database (rtdb) — schema v0.4  (re-running this file is safe)
+--  Roblox Trend Database (rtdb) — schema v0.5  (re-running this file is safe)
 --  Target: PostgreSQL 14+ (Supabase free tier is fine). Apply with:
 --      psql "$DATABASE_URL" -f schema.sql        or        python collector.py init
 --  Design rules:
@@ -672,5 +672,71 @@ LEFT JOIN v_tier t USING (universe_id)
 LEFT JOIN thumbnail_history th ON th.universe_id = e.universe_id
 GROUP BY t.tier
 ORDER BY t.tier;
+
+COMMIT;
+
+
+-- =============================================================================
+-- 10. Explosive radar (schema v0.5)
+-- =============================================================================
+
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS radar_report (
+    universe_id  BIGINT NOT NULL REFERENCES experience(universe_id),
+    report_date  DATE NOT NULL,
+    heat         NUMERIC,
+    triggers     TEXT[],
+    dossier      JSONB,                      -- everything the analyst was shown
+    report       JSONB,                      -- the structured brief
+    markdown     TEXT,                       -- the rendered brief
+    model        TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (universe_id, report_date)
+);
+
+-- Who is igniting right now, why they tripped the radar, and a heat score to rank them.
+CREATE OR REPLACE VIEW v_radar_candidates AS
+WITH first_major AS (
+    SELECT universe_id, min(ts) AS first_on_major
+    FROM chart_position
+    WHERE sort_id IN ('top-trending','up-and-coming','top-playing-now') AND NOT is_sponsored AND position <= 100
+    GROUP BY universe_id
+),
+milestones AS (
+    SELECT universe_id,
+           max(playing) FILTER (WHERE ts >  now() - interval '24 hours') AS max_24h,
+           max(playing) FILTER (WHERE ts <= now() - interval '24 hours') AS max_before
+    FROM snapshot GROUP BY universe_id
+),
+alerts AS (SELECT DISTINCT universe_id FROM v_growth_alerts)
+SELECT e.universe_id, e.name, e.created_at,
+       v.ccu_24h, v.growth_1d, v.growth_7d, v.growth_28d, v.trending_rank_now, v.trending_rank_climb, v.velocity_label,
+       array_remove(ARRAY[
+           CASE WHEN a.universe_id IS NOT NULL                                   THEN 'growth alert: daily players up 50%+ day-over-day' END,
+           CASE WHEN f.first_on_major > now() - interval '24 hours'               THEN 'new to a major chart (top 100) in the last 24h' END,
+           CASE WHEN v.trending_rank_climb >= 20                                  THEN 'climbed 20+ places on Top Trending this week' END,
+           CASE WHEN v.growth_7d >= 1.0 AND v.ccu_24h >= 1000                     THEN 'doubled players in 7 days' END,
+           CASE WHEN m.max_24h >= 50000 AND coalesce(m.max_before, 0) < 50000     THEN 'crossed 50k players for the first time'
+                WHEN m.max_24h >= 10000 AND coalesce(m.max_before, 0) < 10000     THEN 'crossed 10k players for the first time'
+                WHEN m.max_24h >=  2000 AND coalesce(m.max_before, 0) <  2000     THEN 'crossed 2k players for the first time' END
+       ], NULL) AS triggers,
+       (ln(greatest(coalesce(v.ccu_24h, 1), 1))
+          * (1 + coalesce(greatest(v.growth_7d, 0), 0) + 0.5 * coalesce(greatest(v.growth_1d, 0), 0))
+        + CASE WHEN f.first_on_major > now() - interval '24 hours' THEN 3 ELSE 0 END
+        + coalesce(greatest(v.trending_rank_climb, 0), 0) / 10.0
+        + CASE WHEN a.universe_id IS NOT NULL THEN 2 ELSE 0 END)::numeric(8,2) AS heat
+FROM experience e
+JOIN v_velocity v USING (universe_id)
+LEFT JOIN alerts a USING (universe_id)
+LEFT JOIN first_major f USING (universe_id)
+LEFT JOIN milestones m USING (universe_id)
+WHERE e.tracking_tier <> 'paused'
+  AND (a.universe_id IS NOT NULL
+       OR f.first_on_major > now() - interval '24 hours'
+       OR v.trending_rank_climb >= 20
+       OR (v.growth_7d >= 1.0 AND v.ccu_24h >= 1000)
+       OR (m.max_24h >= 2000 AND coalesce(m.max_before, 0) < 2000))
+ORDER BY heat DESC;
 
 COMMIT;
