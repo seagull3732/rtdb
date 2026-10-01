@@ -1,5 +1,5 @@
 -- =============================================================================
---  Roblox Trend Database (rtdb) — schema v0.2  (re-running this file is safe)
+--  Roblox Trend Database (rtdb) — schema v0.4  (re-running this file is safe)
 --  Target: PostgreSQL 14+ (Supabase free tier is fine). Apply with:
 --      psql "$DATABASE_URL" -f schema.sql        or        python collector.py init
 --  Design rules:
@@ -365,12 +365,61 @@ SELECT universe_id, sort_id, max(sort_name) AS sort_name,
 FROM chart_position
 GROUP BY universe_id, sort_id;
 
--- Latest coded value per (game, feature).
+-- Latest coded value per (game, feature). Precedence: a human coder beats the LLM, which beats 'auto';
+-- within the same coder class the newest row wins.
 CREATE OR REPLACE VIEW v_feature_latest AS
 SELECT DISTINCT ON (universe_id, feature_key)
-       universe_id, feature_key, value_text, value_num, coded_at, coder, codebook_version
+       universe_id, feature_key, value_text, value_num, coded_at, coder, codebook_version, evidence
 FROM feature
-ORDER BY universe_id, feature_key, coded_at DESC;
+ORDER BY universe_id, feature_key,
+         CASE WHEN coder = 'auto' THEN 2 WHEN coder = 'llm' THEN 1 ELSE 0 END,
+         coded_at DESC;
+
+-- Numeric features: median among hits vs among controls (the lift table only handles categories).
+CREATE OR REPLACE VIEW v_feature_numeric AS
+WITH f AS (
+    SELECT fl.feature_key, fl.value_num, t.tier, t.population
+    FROM v_feature_latest fl JOIN v_tier t USING (universe_id)
+    WHERE fl.value_num IS NOT NULL
+)
+SELECT feature_key,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY value_num) FILTER (WHERE tier IN ('breakout','hit')) AS median_hits,
+       count(*) FILTER (WHERE tier IN ('breakout','hit'))                                                 AS n_hits,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY value_num) FILTER (WHERE population = 'control')       AS median_control,
+       count(*) FILTER (WHERE population = 'control')                                                     AS n_control
+FROM f
+GROUP BY feature_key
+ORDER BY feature_key;
+
+-- Games whose name, description or images changed after a human/LLM coded them: worth a second look.
+CREATE OR REPLACE VIEW v_recode_candidates AS
+WITH last_coded AS (
+    SELECT universe_id, max(coded_at) AS coded_at FROM feature WHERE coder <> 'auto' GROUP BY universe_id
+),
+changes AS (
+    SELECT universe_id, max(first_seen_at) AS changed_at FROM (
+        SELECT universe_id, first_seen_at FROM name_history
+        UNION ALL SELECT universe_id, first_seen_at FROM description_history
+        UNION ALL SELECT universe_id, first_seen_at FROM thumbnail_history
+    ) x GROUP BY universe_id
+)
+SELECT e.universe_id, e.name, lc.coded_at AS last_coded_at, ch.changed_at
+FROM experience e
+JOIN last_coded lc USING (universe_id)
+JOIN changes ch USING (universe_id)
+WHERE ch.changed_at > lc.coded_at + interval '1 hour'
+ORDER BY ch.changed_at DESC;
+
+-- How far the coding has got, per feature.
+CREATE OR REPLACE VIEW v_coding_progress AS
+SELECT c.family, c.feature_key,
+       count(DISTINCT f.universe_id)                                            AS games_coded,
+       count(DISTINCT f.universe_id) FILTER (WHERE f.coder = 'llm')             AS by_llm,
+       count(DISTINCT f.universe_id) FILTER (WHERE f.coder NOT IN ('auto','llm')) AS by_humans
+FROM codebook c
+LEFT JOIN feature f USING (feature_key)
+GROUP BY c.family, c.feature_key
+ORDER BY c.family, c.feature_key;
 
 -- Lift table for categorical/bool features: prevalence among hits+breakouts vs the control frame.
 -- Compute confidence intervals in Python (Wilson); this view gives the point estimates.
@@ -433,5 +482,195 @@ JOIN experience e USING (universe_id)
 JOIN v_tier t USING (universe_id)
 WHERE fl.feature_key = 'core_loop' AND e.created_at IS NOT NULL
 GROUP BY 1, 2;
+
+COMMIT;
+
+-- =============================================================================
+-- 9. Partner round: categories, velocity, retention proxies, cohorts, thumbnails
+--    (schema v0.4 — appended; re-running the whole file is still safe)
+-- =============================================================================
+
+BEGIN;
+
+-- play_mode: the explicit PvE / PvP / social / party / trading label, coded by the LLM pass.
+INSERT INTO codebook (feature_key, family, value_type, definition, allowed_values) VALUES
+ ('play_mode','play','multi','How players relate to the game and each other: all that apply.','pve|pvp|coop|social|party|trading|roleplay|creative')
+ON CONFLICT (feature_key) DO NOTHING;
+
+-- One primary category per game, derived from play_mode, then core_loop, then Roblox's own genre.
+CREATE OR REPLACE VIEW v_category AS
+WITH f AS (
+    SELECT universe_id,
+           max(value_text) FILTER (WHERE feature_key = 'play_mode') AS play_mode,
+           max(value_text) FILTER (WHERE feature_key = 'core_loop') AS core_loop
+    FROM v_feature_latest
+    WHERE feature_key IN ('play_mode', 'core_loop')
+    GROUP BY universe_id
+)
+SELECT e.universe_id, e.name, e.genre_l1, e.genre_l2, f.play_mode, f.core_loop,
+       CASE
+         WHEN f.play_mode LIKE '%pvp%'      THEN 'PvP'
+         WHEN f.play_mode LIKE '%coop%'     THEN 'Co-op PvE'
+         WHEN f.play_mode LIKE '%trading%'  THEN 'Trading'
+         WHEN f.play_mode LIKE '%party%'    THEN 'Party'
+         WHEN f.play_mode LIKE '%social%'   THEN 'Social'
+         WHEN f.play_mode LIKE '%roleplay%' THEN 'Roleplay'
+         WHEN f.play_mode LIKE '%creative%' THEN 'Creative'
+         WHEN f.play_mode LIKE '%pve%'      THEN 'PvE'
+         WHEN f.core_loop IN ('round_pvp','shooter','sports','steal') THEN 'PvP'
+         WHEN f.core_loop IN ('roleplay')                            THEN 'Roleplay'
+         WHEN f.core_loop IN ('collect','grow','tycoon','idle','rng','obby','horror') THEN 'PvE'
+         WHEN e.genre_l1 ILIKE '%roleplay%' OR e.genre_l1 ILIKE '%avatar%' THEN 'Roleplay'
+         WHEN e.genre_l1 ILIKE '%party%'   THEN 'Party'
+         WHEN e.genre_l1 ILIKE '%shooter%' OR e.genre_l1 ILIKE '%sports%' OR e.genre_l1 ILIKE '%action%' THEN 'PvP'
+         WHEN e.genre_l1 IS NOT NULL THEN 'PvE'
+         ELSE 'Uncategorised' END AS category
+FROM experience e
+LEFT JOIN f USING (universe_id);
+
+-- Velocity: how fast each game is gaining or losing players, over three horizons, plus chart movement.
+CREATE OR REPLACE VIEW v_velocity AS
+WITH w AS (
+    SELECT universe_id,
+           avg(playing) FILTER (WHERE ts > now() - interval '24 hours')                                                   AS ccu_24h,
+           avg(playing) FILTER (WHERE ts BETWEEN now() - interval '48 hours' AND now() - interval '24 hours')             AS ccu_prev_24h,
+           avg(playing) FILTER (WHERE ts BETWEEN now() - interval '8 days'   AND now() - interval '7 days')               AS ccu_7d_ago,
+           avg(playing) FILTER (WHERE ts BETWEEN now() - interval '29 days'  AND now() - interval '28 days')              AS ccu_28d_ago,
+           max(playing) FILTER (WHERE ts > now() - interval '7 days')                                                     AS peak_7d
+    FROM snapshot
+    WHERE ts > now() - interval '29 days' AND playing IS NOT NULL
+    GROUP BY universe_id
+),
+r AS (
+    SELECT universe_id,
+           min(position) FILTER (WHERE ts > now() - interval '24 hours' AND sort_id = 'top-trending' AND NOT is_sponsored)                              AS trending_rank_now,
+           min(position) FILTER (WHERE ts BETWEEN now() - interval '8 days' AND now() - interval '7 days' AND sort_id = 'top-trending' AND NOT is_sponsored) AS trending_rank_7d_ago
+    FROM chart_position
+    WHERE ts > now() - interval '8 days'
+    GROUP BY universe_id
+)
+SELECT e.universe_id, e.name,
+       round(w.ccu_24h)::int                                             AS ccu_24h,
+       (w.ccu_24h / NULLIF(w.ccu_prev_24h, 0) - 1)::numeric(8,3)          AS growth_1d,
+       (w.ccu_24h / NULLIF(w.ccu_7d_ago, 0) - 1)::numeric(8,3)            AS growth_7d,
+       (w.ccu_24h / NULLIF(w.ccu_28d_ago, 0) - 1)::numeric(8,3)           AS growth_28d,
+       w.peak_7d,
+       r.trending_rank_now, r.trending_rank_7d_ago,
+       (r.trending_rank_7d_ago - r.trending_rank_now)                     AS trending_rank_climb,   -- positive = moved up
+       CASE WHEN w.ccu_7d_ago IS NULL                       THEN 'new / no 7-day baseline'
+            WHEN w.ccu_24h / NULLIF(w.ccu_7d_ago, 0) - 1 >  0.50 THEN 'surging'
+            WHEN w.ccu_24h / NULLIF(w.ccu_7d_ago, 0) - 1 >  0.10 THEN 'growing'
+            WHEN w.ccu_24h / NULLIF(w.ccu_7d_ago, 0) - 1 > -0.10 THEN 'flat'
+            WHEN w.ccu_24h / NULLIF(w.ccu_7d_ago, 0) - 1 > -0.40 THEN 'declining'
+            ELSE 'collapsing' END                                         AS velocity_label
+FROM experience e
+JOIN w USING (universe_id)
+LEFT JOIN r USING (universe_id);
+
+-- Retention PROXIES. Roblox does not publish retention for other studios' games; these are the closest public
+-- stand-ins: how much of its peak a game keeps on days 8–28, how fast it decays, and how players rate it.
+-- True D1/D7/D30 exists only for your own games (own_experiment).
+CREATE OR REPLACE VIEW v_retention_proxy AS
+WITH latest AS (
+    SELECT DISTINCT ON (universe_id) universe_id, ts, playing, visits, favorites, upvotes, downvotes
+    FROM snapshot ORDER BY universe_id, ts DESC
+)
+SELECT e.universe_id, e.name,
+       s.sustain_ratio                                                     AS staying_power_d8_28,   -- 1.0 = still at peak
+       d.half_life_days,
+       (l.upvotes::numeric / NULLIF(l.upvotes + l.downvotes, 0))::numeric(5,3) AS like_ratio,
+       (l.favorites::numeric * 1000 / NULLIF(l.visits, 0))::numeric(8,3)       AS favourites_per_1k_visits,
+       l.visits, l.favorites, l.ts AS as_of
+FROM experience e
+JOIN latest l USING (universe_id)
+LEFT JOIN v_sustained s USING (universe_id)
+LEFT JOIN v_decay d USING (universe_id);
+
+-- Cohorts by launch month. Note the frame: games we track are games that reached a front-page sort,
+-- so these are "games that got noticed", not all games created that month.
+CREATE OR REPLACE VIEW v_cohort_monthly AS
+SELECT date_trunc('month', e.created_at)::date                             AS cohort_month,
+       CASE WHEN e.created_at >= '2026-06-15' THEN 'post RFY 28-day' ELSE 'pre' END AS regime,
+       count(*)                                                            AS games_tracked,
+       count(*) FILTER (WHERE p.peak_max_ccu >= 2000)                       AS reached_2k,
+       count(*) FILTER (WHERE p.peak_max_ccu >= 20000)                      AS reached_20k,
+       count(*) FILTER (WHERE p.peak_max_ccu >= 100000)                     AS reached_100k,
+       (count(*) FILTER (WHERE p.peak_max_ccu >= 20000))::numeric / NULLIF(count(*), 0) AS hit_rate,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY p.peak_max_ccu)         AS median_peak,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY d.half_life_days)       AS median_half_life_days,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY s.sustain_ratio)        AS median_staying_power
+FROM experience e
+LEFT JOIN v_peak p USING (universe_id)
+LEFT JOIN v_decay d USING (universe_id)
+LEFT JOIN v_sustained s USING (universe_id)
+WHERE e.created_at >= '2024-01-01'
+GROUP BY 1, 2
+ORDER BY 1;
+
+-- Median trajectory of launch-cohort games by days since creation, per cohort month.
+CREATE OR REPLACE VIEW v_cohort_curve AS
+SELECT date_trunc('month', e.created_at)::date                 AS cohort_month,
+       (d.day - e.created_at::date)                            AS day_n,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY d.avg_ccu)  AS median_ccu,
+       count(*)                                                AS games
+FROM v_daily_ccu d
+JOIN experience e USING (universe_id)
+WHERE e.launch_cohort AND d.day >= e.created_at::date
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+-- Category roll-up: everything the partner asked to see per category, side by side.
+CREATE OR REPLACE VIEW v_category_summary AS
+SELECT c.category,
+       count(*)                                                                      AS games,
+       count(*) FILTER (WHERE t.tier IN ('breakout','hit'))                           AS hits,
+       count(*) FILTER (WHERE e.created_at > now() - interval '30 days')              AS entrants_30d,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY v.growth_7d)                       AS median_growth_7d,
+       count(*) FILTER (WHERE v.velocity_label = 'surging')                           AS surging_now,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.staying_power_d8_28)             AS median_staying_power,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.half_life_days)                  AS median_half_life_days,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY r.like_ratio)                      AS median_like_ratio,
+       sum(v.ccu_24h)                                                                 AS players_now
+FROM v_category c
+JOIN experience e USING (universe_id)
+LEFT JOIN v_tier t USING (universe_id)
+LEFT JOIN v_velocity v USING (universe_id)
+LEFT JOIN v_retention_proxy r USING (universe_id)
+GROUP BY c.category
+ORDER BY players_now DESC NULLS LAST;
+
+-- Thumbnail evaluation (observational): players in the 7 days before vs after each icon/banner change.
+CREATE OR REPLACE VIEW v_thumbnail_impact AS
+WITH changes AS (
+    SELECT th.universe_id, th.kind, th.image_url, th.first_seen_at AS changed_at
+    FROM thumbnail_history th
+    JOIN experience e USING (universe_id)
+    WHERE th.first_seen_at > e.first_seen_at + interval '1 hour'    -- a real change, not the first capture
+)
+SELECT c.universe_id, e.name, c.kind, c.changed_at, c.image_url,
+       avg(s.playing) FILTER (WHERE s.ts >= c.changed_at - interval '7 days' AND s.ts <  c.changed_at)::numeric(12,1) AS ccu_before_7d,
+       avg(s.playing) FILTER (WHERE s.ts >  c.changed_at AND s.ts <= c.changed_at + interval '7 days')::numeric(12,1) AS ccu_after_7d,
+       (avg(s.playing) FILTER (WHERE s.ts >  c.changed_at AND s.ts <= c.changed_at + interval '7 days')
+        / NULLIF(avg(s.playing) FILTER (WHERE s.ts >= c.changed_at - interval '7 days' AND s.ts < c.changed_at), 0) - 1)::numeric(8,3) AS change_pct
+FROM changes c
+JOIN experience e USING (universe_id)
+LEFT JOIN snapshot s ON s.universe_id = c.universe_id
+                    AND s.ts BETWEEN c.changed_at - interval '7 days' AND c.changed_at + interval '7 days'
+GROUP BY c.universe_id, e.name, c.kind, c.changed_at, c.image_url
+ORDER BY c.changed_at DESC;
+
+-- How often games change their icon/banner, by tier: do hits refresh their thumbnails more?
+CREATE OR REPLACE VIEW v_thumbnail_churn AS
+SELECT t.tier,
+       count(DISTINCT e.universe_id)                                                        AS games,
+       count(th.*) FILTER (WHERE th.first_seen_at > e.first_seen_at + interval '1 hour')     AS changes_observed,
+       (count(th.*) FILTER (WHERE th.first_seen_at > e.first_seen_at + interval '1 hour'))::numeric
+         / NULLIF(count(DISTINCT e.universe_id), 0)                                         AS changes_per_game,
+       min(e.first_seen_at)                                                                 AS observed_since
+FROM experience e
+LEFT JOIN v_tier t USING (universe_id)
+LEFT JOIN thumbnail_history th ON th.universe_id = e.universe_id
+GROUP BY t.tier
+ORDER BY t.tier;
 
 COMMIT;
