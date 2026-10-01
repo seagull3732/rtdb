@@ -11,6 +11,7 @@ on:
     - cron: "20 3 * * *"     # daily refresh
     - cron: "40 4 * * 1"     # weekly feature coding (auto traits, then the LLM pass if a key is set)
     - cron: "0 14 * * *"     # daily explosive radar (07:00 Pacific); briefs committed to reports/
+    - cron: "30 15 * * 1"    # weekly opportunity engine (Mondays, after the radar); 3 briefs committed to reports/
     - cron: "0 2 * * 0"      # weekly backup → release "backups" (encrypted when BACKUP_PASSPHRASE is set)
     - cron: "30 2 1 * *"     # monthly archive of last month's snapshot + chart_position rows
     - cron: "0 12 * * 0"     # weekly heartbeat commit (keeps the schedule from being paused)
@@ -20,7 +21,7 @@ on:
         description: "Job to run by hand"
         type: choice
         default: stats
-        options: [stats, sorts, promote, daily, sample-controls, probe, passes, platform-ccu, code-auto, code-llm, radar, backup, archive-month]
+        options: [stats, sorts, promote, daily, sample-controls, probe, passes, platform-ccu, code-auto, code-llm, radar, opportunity, backup, archive-month, purge-public-reports]
 
 permissions:
   contents: write            # only used by the heartbeat commit
@@ -39,6 +40,8 @@ jobs:
       RTDB_CONTACT: ${{ secrets.RTDB_CONTACT }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       RTDB_DISCORD_WEBHOOK: ${{ secrets.RTDB_DISCORD_WEBHOOK }}
+      REPORTS_REPO: ${{ secrets.REPORTS_REPO }}
+      REPORTS_TOKEN: ${{ secrets.REPORTS_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -80,14 +83,23 @@ jobs:
         run: |
           set -e
           python radar.py run
-          if ls reports/*.md >/dev/null 2>&1; then
-            git config user.name "rtdb-bot"
-            git config user.email "rtdb-bot@users.noreply.github.com"
-            git add reports
-            git commit -m "radar: $(date -u +%F)" || exit 0
-            git pull --rebase --autostash origin main || true
-            git push
-          fi
+          bash publish_reports.sh radar
+
+      - name: opportunity engine
+        if: github.event.schedule == '30 15 * * 1' || inputs.job == 'opportunity'
+        run: |
+          set -e
+          python opportunity.py run --top 3
+          bash publish_reports.sh opportunities
+
+      - name: remove reports from this (public) repository
+        if: inputs.job == 'purge-public-reports'
+        run: |
+          git config user.name "rtdb-bot"
+          git config user.email "rtdb-bot@users.noreply.github.com"
+          git rm -r --quiet --ignore-unmatch reports || true
+          git commit -m "move reports to the private repository" || exit 0
+          git push
 
       - name: backup / archive
         if: github.event.schedule == '0 2 * * 0' || github.event.schedule == '30 2 1 * *' || inputs.job == 'backup' || inputs.job == 'archive-month'
