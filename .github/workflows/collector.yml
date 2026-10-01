@@ -20,7 +20,7 @@ on:
         description: "Job to run by hand"
         type: choice
         default: stats
-        options: [stats, sorts, promote, daily, sample-controls, probe, passes, code-auto, code-llm, radar, backup, archive-month]
+        options: [stats, sorts, promote, daily, sample-controls, probe, passes, platform-ccu, code-auto, code-llm, radar, backup, archive-month]
 
 permissions:
   contents: write            # only used by the heartbeat commit
@@ -66,7 +66,7 @@ jobs:
         run: python collector.py daily
 
       - name: other manual jobs
-        if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["promote","sample-controls","probe","passes"]'), inputs.job)
+        if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["promote","sample-controls","probe","passes","platform-ccu"]'), inputs.job)
         run: python collector.py ${{ inputs.job }}
 
       - name: weekly feature coding
