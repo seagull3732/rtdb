@@ -1,5 +1,5 @@
 -- =============================================================================
---  Roblox Trend Database (rtdb) — schema v0.9  (re-running this file is safe)
+--  Roblox Trend Database (rtdb) — schema v0.10  (re-running this file is safe)
 --  Target: PostgreSQL 14+ (Supabase free tier is fine). Apply with:
 --      psql "$DATABASE_URL" -f schema.sql        or        python collector.py init
 --  Design rules:
@@ -804,15 +804,45 @@ SELECT (ts AT TIME ZONE 'UTC')::date AS day, avg(ccu)::bigint AS avg_ccu, max(cc
 FROM platform_ccu GROUP BY 1 ORDER BY 1;
 
 -- Same-hours and 7-day platform growth, matching the per-game definitions in v_velocity.
-CREATE OR REPLACE VIEW v_platform_context AS
-SELECT round(avg(ccu) FILTER (WHERE ts > now() - interval '6 hours'))::bigint                                                  AS platform_ccu_6h,
-       round(avg(ccu) FILTER (WHERE ts BETWEEN now() - interval '30 hours' AND now() - interval '24 hours'))::bigint             AS platform_ccu_6h_yesterday,
-       (avg(ccu) FILTER (WHERE ts > now() - interval '6 hours')
-          / NULLIF(avg(ccu) FILTER (WHERE ts BETWEEN now() - interval '30 hours' AND now() - interval '24 hours'), 0) - 1)::numeric(8,3) AS platform_growth_same_hours,
-       (avg(ccu) FILTER (WHERE ts > now() - interval '24 hours')
-          / NULLIF(avg(ccu) FILTER (WHERE ts BETWEEN now() - interval '8 days' AND now() - interval '7 days'), 0) - 1)::numeric(8,3)   AS platform_growth_7d,
-       max(ts) AS as_of
-FROM platform_ccu
-WHERE ts > now() - interval '9 days';
+-- Basis: an external Roblox-wide feed (platform_ccu) when one is loaded; otherwise a balanced basket of the games we
+-- track ourselves (only games with samples in both windows count, so the basket's membership can't skew the ratio).
+DROP VIEW IF EXISTS v_platform_context;
+CREATE VIEW v_platform_context AS
+WITH ext AS (
+    SELECT avg(ccu) FILTER (WHERE ts > now() - interval '6 hours')                                                   AS now6,
+           avg(ccu) FILTER (WHERE ts BETWEEN now() - interval '30 hours' AND now() - interval '24 hours')             AS yday6,
+           avg(ccu) FILTER (WHERE ts > now() - interval '24 hours')                                                  AS d1,
+           avg(ccu) FILTER (WHERE ts BETWEEN now() - interval '8 days' AND now() - interval '7 days')                 AS d7,
+           max(ts) AS as_of
+    FROM platform_ccu WHERE ts > now() - interval '9 days'
+),
+panel AS (
+    SELECT universe_id,
+           avg(playing) FILTER (WHERE ts > now() - interval '6 hours')                                               AS now6,
+           avg(playing) FILTER (WHERE ts BETWEEN now() - interval '30 hours' AND now() - interval '24 hours')         AS yday6,
+           avg(playing) FILTER (WHERE ts > now() - interval '24 hours')                                              AS d1,
+           avg(playing) FILTER (WHERE ts BETWEEN now() - interval '8 days' AND now() - interval '7 days')             AS d7,
+           max(ts) AS as_of
+    FROM snapshot WHERE ts > now() - interval '9 days' AND source = 'rtdb' AND playing IS NOT NULL
+    GROUP BY universe_id
+),
+basket AS (
+    SELECT sum(now6)  FILTER (WHERE now6 IS NOT NULL AND yday6 IS NOT NULL) AS now6,
+           sum(yday6) FILTER (WHERE now6 IS NOT NULL AND yday6 IS NOT NULL) AS yday6,
+           sum(d1)    FILTER (WHERE d1 IS NOT NULL AND d7 IS NOT NULL)      AS d1,
+           sum(d7)    FILTER (WHERE d1 IS NOT NULL AND d7 IS NOT NULL)      AS d7,
+           count(*)   FILTER (WHERE now6 IS NOT NULL AND yday6 IS NOT NULL) AS games_same_hours,
+           count(*)   FILTER (WHERE d1 IS NOT NULL AND d7 IS NOT NULL)      AS games_7d,
+           max(as_of) AS as_of
+    FROM panel
+)
+SELECT round(coalesce(ext.now6, basket.now6))::bigint                                            AS platform_ccu_6h,
+       round(coalesce(ext.yday6, basket.yday6))::bigint                                          AS platform_ccu_6h_yesterday,
+       (coalesce(ext.now6, basket.now6) / NULLIF(coalesce(ext.yday6, basket.yday6), 0) - 1)::numeric(8,3) AS platform_growth_same_hours,
+       (coalesce(ext.d1, basket.d1) / NULLIF(coalesce(ext.d7, basket.d7), 0) - 1)::numeric(8,3)         AS platform_growth_7d,
+       coalesce(ext.as_of, basket.as_of)                                                         AS as_of,
+       CASE WHEN ext.now6 IS NOT NULL THEN 'external Roblox-wide feed'
+            ELSE 'balanced basket of ' || basket.games_same_hours || ' tracked games (same-hours) / ' || basket.games_7d || ' (7-day)' END AS basis
+FROM ext, basket;
 
 COMMIT;

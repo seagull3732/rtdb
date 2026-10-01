@@ -54,8 +54,9 @@ Write an evidence-weighted brief. Rules:
 - If the dossier cannot explain the surge, say so plainly instead of inventing a story.
 - The dossier includes growth_same_hours (the last 6 hours vs the same 6 hours yesterday). Use it to separate a real
   rise from the daily cycle before anything else; verdict daily_cycle_or_artifact when that is the best explanation.
-- platform_wide_context gives the same growth figures for all of Roblox. A game that grew 40% while the platform grew
-  35% did not meaningfully outgrow the platform; say so and discount the surge accordingly.
+- platform_wide_context gives the same growth figures for the platform (its "basis" says whether that is a Roblox-wide
+  feed or the basket of games this database tracks). A game that grew 40% while the platform grew 35% did not
+  meaningfully outgrow the platform; say so and discount the surge accordingly.
 Return ONE JSON object and nothing else:
 {"verdict": "one of: real_breakout | event_spike | daily_cycle_or_artifact | unclear",
  "headline": "<= 15 words", "what_it_is": "1-2 sentences", "whats_happening": "2-3 sentences with numbers",

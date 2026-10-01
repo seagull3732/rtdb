@@ -119,7 +119,7 @@ THUMBS_API = "https://thumbnails.roblox.com/v1/games/multiget/thumbnails"
 EXPLORE_SORTS = "https://apis.roblox.com/explore-api/v1/get-sorts"
 EXPLORE_CONTENT = "https://apis.roblox.com/explore-api/v1/get-sort-content"
 GROUPS_API = "https://groups.roblox.com/v1/groups/{gid}"
-PLATFORM_CCU_API = "https://api.romonitorstats.com/count"   # Roblox-wide CCU, half-hourly; one small request per day
+PLATFORM_CCU_API = os.environ.get("RTDB_PLATFORM_CCU_URL", "https://api.romonitorstats.com/count")   # optional external Roblox-wide CCU feed
 USERS_API = "https://users.roblox.com/v1/users/{uid}"
 
 BATCH = 50  # universe ids per multi-get call
@@ -684,6 +684,14 @@ def job_platform_ccu(conn, http: Http, since_default: str = "2024-01-01") -> int
     """Load Roblox-wide concurrent users from RoMonitor's public platform endpoint, from the last stored
     point (or 2024-01-01) to now, in 30-day requests. Light use by design: after the first run it is one request a day."""
     from datetime import date, timedelta
+    import socket
+    host = urlparse(PLATFORM_CCU_API).hostname or ""
+    try:
+        socket.getaddrinfo(host, 443)
+    except OSError:
+        log.info("platform-ccu: %s does not resolve; skipping. v_platform_context uses the tracked-games basket instead "
+                 "(set RTDB_PLATFORM_CCU_URL if an external Roblox-wide feed becomes available)", host)
+        return 0
     with conn.cursor() as cur:
         cur.execute("SELECT max(ts) FROM platform_ccu")
         last = cur.fetchone()[0]
@@ -692,7 +700,7 @@ def job_platform_ccu(conn, http: Http, since_default: str = "2024-01-01") -> int
     total = 0
     while start <= today:
         end = min(start + timedelta(days=30), today)
-        data = http.get_json(PLATFORM_CCU_API, {"start": start.isoformat(), "end": end.isoformat()}) or []
+        data = http.get_json(PLATFORM_CCU_API, {"start": start.isoformat(), "end": end.isoformat()}, attempts=2) or []
         rows = []
         for p in (data if isinstance(data, list) else data.get("data", [])):
             t, n = parse_ts(p.get("time") or p.get("timestamp")), as_int(p.get("count") or p.get("ccu"))
