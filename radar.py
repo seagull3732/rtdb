@@ -54,6 +54,8 @@ Write an evidence-weighted brief. Rules:
 - If the dossier cannot explain the surge, say so plainly instead of inventing a story.
 - The dossier includes growth_same_hours (the last 6 hours vs the same 6 hours yesterday). Use it to separate a real
   rise from the daily cycle before anything else; verdict daily_cycle_or_artifact when that is the best explanation.
+- platform_wide_context gives the same growth figures for all of Roblox. A game that grew 40% while the platform grew
+  35% did not meaningfully outgrow the platform; say so and discount the surge accordingly.
 Return ONE JSON object and nothing else:
 {"verdict": "one of: real_breakout | event_spike | daily_cycle_or_artifact | unclear",
  "headline": "<= 15 words", "what_it_is": "1-2 sentences", "whats_happening": "2-3 sentences with numbers",
@@ -167,6 +169,7 @@ def build_dossier(conn, uid: int, cand: dict, lift: dict) -> dict:
                (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY favourites_per_1k_visits) FROM pop) AS median_favourites_per_1k_visits,
                p.like_pct AS this_game_like_ratio_percentile, p.fav_pct AS this_game_favourites_percentile
         FROM pop p WHERE p.universe_id = %s""", (uid,))
+    platform = q(conn, "SELECT * FROM v_platform_context")
     cohort = q(conn, """
         SELECT median_ccu, games FROM v_cohort_curve
         WHERE cohort_month = date_trunc('month', %s::timestamptz)::date AND day_n = %s""",
@@ -183,6 +186,7 @@ def build_dossier(conn, uid: int, cand: dict, lift: dict) -> dict:
         "creators_other_games": creator_other,
         "cohort_baseline_same_age": (cohort[0] if cohort else "no cohort baseline yet (needs more history)"),
         "reception_benchmarks_all_tracked_games": (bench[0] if bench else None),
+        "platform_wide_context": (platform[0] if platform and platform[0].get("platform_ccu_6h") else "no platform-wide data loaded yet"),
         "data_caveats": ["player counts are concurrent users sampled every 30-60 min; they can be inflated by bots",
                          "retention is a proxy (staying power), not measured retention",
                          "the charts both reflect and cause growth; a chart entry is not an independent signal",

@@ -23,6 +23,8 @@ Every job appends its log to logs/<job>-<YYYY-MM-DD>.log next to this script.
                     (python collector.py sample-controls --n 300 --lo 200 --hi 2000).
   passes            Refresh game passes for every tracked game now (about 10 minutes); the daily job
                     otherwise refreshes a seventh of them each day.
+  platform-ccu      Load Roblox-wide concurrent users (RoMonitor's public platform count) since 2024; the
+                    daily job keeps it current with one request a day.
 
 Settings come from environment variables, or from a file named secrets.txt or .env next to this
 script. In that file, a bare line starting with postgresql:// becomes DATABASE_URL; other lines
@@ -117,6 +119,7 @@ THUMBS_API = "https://thumbnails.roblox.com/v1/games/multiget/thumbnails"
 EXPLORE_SORTS = "https://apis.roblox.com/explore-api/v1/get-sorts"
 EXPLORE_CONTENT = "https://apis.roblox.com/explore-api/v1/get-sort-content"
 GROUPS_API = "https://groups.roblox.com/v1/groups/{gid}"
+PLATFORM_CCU_API = "https://api.romonitorstats.com/count"   # Roblox-wide CCU, half-hourly; one small request per day
 USERS_API = "https://users.roblox.com/v1/users/{uid}"
 
 BATCH = 50  # universe ids per multi-get call
@@ -126,6 +129,7 @@ BATCH = 50  # universe ids per multi-get call
 _SLOW = float(os.environ.get("RTDB_GAMES_INTERVAL_S", "3.0"))
 _CREATOR = float(os.environ.get("RTDB_CREATOR_INTERVAL_S", "10.0"))   # groups.roblox.com throttled at 3 s
 HOST_MIN_INTERVAL = {
+    "api.romonitorstats.com": 2.0,
     "apis.roblox.com": 0.5,
     "games.roblox.com": _SLOW,
     "groups.roblox.com": _CREATOR,
@@ -676,6 +680,37 @@ def job_probe(conn, http: Http) -> int:
     return 0
 
 
+def job_platform_ccu(conn, http: Http, since_default: str = "2024-01-01") -> int:
+    """Load Roblox-wide concurrent users from RoMonitor's public platform endpoint, from the last stored
+    point (or 2024-01-01) to now, in 30-day requests. Light use by design: after the first run it is one request a day."""
+    from datetime import date, timedelta
+    with conn.cursor() as cur:
+        cur.execute("SELECT max(ts) FROM platform_ccu")
+        last = cur.fetchone()[0]
+    start = (last.date() if last else date.fromisoformat(since_default))
+    today = datetime.now(timezone.utc).date()
+    total = 0
+    while start <= today:
+        end = min(start + timedelta(days=30), today)
+        data = http.get_json(PLATFORM_CCU_API, {"start": start.isoformat(), "end": end.isoformat()}) or []
+        rows = []
+        for p in (data if isinstance(data, list) else data.get("data", [])):
+            t, n = parse_ts(p.get("time") or p.get("timestamp")), as_int(p.get("count") or p.get("ccu"))
+            if t and n is not None:
+                rows.append((t, n))
+        if rows:
+            with conn.cursor() as cur:
+                cur.executemany("INSERT INTO platform_ccu (ts, ccu) VALUES (%s,%s) ON CONFLICT (ts) DO NOTHING", rows)
+            conn.commit()
+            total += len(rows)
+        log.info("platform-ccu: %s → %s, %d points", start, end, len(rows))
+        if end >= today:
+            break
+        start = end
+    log.info("platform-ccu: %d points loaded", total)
+    return total
+
+
 def job_passes(conn, http: Http) -> int:
     """One-off / ad hoc: refresh game passes for every tracked game (the daily job only does a weekly rotation)."""
     ts = run_ts()
@@ -859,6 +894,10 @@ def job_daily(conn, http: Http) -> int:
             conn.commit()
             log.info("daily: creators %d/%d", j, len(due_c))
     conn.commit()
+    try:
+        job_platform_ccu(conn, http)
+    except Exception as e:
+        log.warning("platform-ccu failed (non-fatal): %s", e)
     log.info("daily: done — %d games, %d pass refreshes, %d creators; %d requests, %d throttled",
              len(ids), len(due), len(due_c), http.requests, http.throttled)
     return n
@@ -975,7 +1014,7 @@ def job_init(conn, http: Http, schema_path: str) -> int:
 # ----------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("job", choices=["init", "probe", "probe-passes", "sorts", "stats", "daily", "promote", "sample-controls", "passes"])
+    ap.add_argument("job", choices=["init", "probe", "probe-passes", "sorts", "stats", "daily", "promote", "sample-controls", "passes", "platform-ccu"])
     ap.add_argument("--schema", default=os.path.join(BASE_DIR, "schema.sql"))
     ap.add_argument("--n", type=int, default=300, help="sample-controls: how many")
     ap.add_argument("--lo", type=int, default=200, help="sample-controls: min CCU")
@@ -1017,6 +1056,8 @@ def main(argv: list[str] | None = None) -> int:
                     rows = job_promote(conn, http)
                 elif args.job == "passes":
                     rows = job_passes(conn, http)
+                elif args.job == "platform-ccu":
+                    rows = job_platform_ccu(conn, http)
                 else:
                     rows = job_sample_controls(conn, http, args.n, args.lo, args.hi)
             except Exception as e:

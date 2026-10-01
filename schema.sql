@@ -1,5 +1,5 @@
 -- =============================================================================
---  Roblox Trend Database (rtdb) — schema v0.8  (re-running this file is safe)
+--  Roblox Trend Database (rtdb) — schema v0.9  (re-running this file is safe)
 --  Target: PostgreSQL 14+ (Supabase free tier is fine). Apply with:
 --      psql "$DATABASE_URL" -f schema.sql        or        python collector.py init
 --  Design rules:
@@ -731,7 +731,8 @@ alerts AS (SELECT DISTINCT universe_id FROM v_growth_alerts),
 base AS (
     SELECT e.universe_id, e.name, e.created_at, v.ccu_24h, v.growth_1d, v.growth_7d, v.growth_28d,
            v.trending_rank_now, v.trending_rank_climb, v.velocity_label, v.momentum,
-           (e.first_seen_at < now() - interval '7 days' OR e.created_at > now() - interval '60 days') AS history_ok,
+           (e.first_seen_at < now() - interval '7 days' OR e.created_at > now() - interval '60 days'
+              OR EXISTS (SELECT 1 FROM snapshot s7 WHERE s7.universe_id = e.universe_id AND s7.ts < now() - interval '7 days')) AS history_ok,
            v.growth_same_hours, v.ccu_cv_24h,
            (a.universe_id IS NOT NULL)                                                   AS t_alert,
            (v.growth_same_hours >= 0.5 AND v.ccu_6h >= 300)                              AS t_same_hours,
@@ -778,3 +779,40 @@ COMMIT;
 -- v0.7 cleanup: earlier auto runs wrote 0 for "no earlier game by this creator in the database"; that is unknown, not zero.
 DELETE FROM feature WHERE feature_key = 'creator_prior_peak_ccu' AND coder = 'auto' AND value_num = 0
   AND evidence LIKE 'no earlier experience%';
+
+
+-- =============================================================================
+-- 11. History sources (schema v0.9): backfilled per-game history and platform-wide context
+-- =============================================================================
+
+BEGIN;
+
+-- Where each snapshot row came from: 'rtdb' = our own collector; anything else = imported history (rtrack, romonitor, csv...).
+ALTER TABLE snapshot ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'rtdb';
+CREATE INDEX IF NOT EXISTS snapshot_source_idx ON snapshot (source) WHERE source <> 'rtdb';
+
+-- Roblox-wide concurrent users (all experiences), from RoMonitor Stats' public platform count endpoint.
+-- Used to tell "this game grew" apart from "the whole platform was busier".
+CREATE TABLE IF NOT EXISTS platform_ccu (
+    ts      TIMESTAMPTZ PRIMARY KEY,
+    ccu     BIGINT NOT NULL,
+    source  TEXT NOT NULL DEFAULT 'romonitor'
+);
+
+CREATE OR REPLACE VIEW v_platform_daily AS
+SELECT (ts AT TIME ZONE 'UTC')::date AS day, avg(ccu)::bigint AS avg_ccu, max(ccu) AS max_ccu, count(*) AS samples
+FROM platform_ccu GROUP BY 1 ORDER BY 1;
+
+-- Same-hours and 7-day platform growth, matching the per-game definitions in v_velocity.
+CREATE OR REPLACE VIEW v_platform_context AS
+SELECT round(avg(ccu) FILTER (WHERE ts > now() - interval '6 hours'))::bigint                                                  AS platform_ccu_6h,
+       round(avg(ccu) FILTER (WHERE ts BETWEEN now() - interval '30 hours' AND now() - interval '24 hours'))::bigint             AS platform_ccu_6h_yesterday,
+       (avg(ccu) FILTER (WHERE ts > now() - interval '6 hours')
+          / NULLIF(avg(ccu) FILTER (WHERE ts BETWEEN now() - interval '30 hours' AND now() - interval '24 hours'), 0) - 1)::numeric(8,3) AS platform_growth_same_hours,
+       (avg(ccu) FILTER (WHERE ts > now() - interval '24 hours')
+          / NULLIF(avg(ccu) FILTER (WHERE ts BETWEEN now() - interval '8 days' AND now() - interval '7 days'), 0) - 1)::numeric(8,3)   AS platform_growth_7d,
+       max(ts) AS as_of
+FROM platform_ccu
+WHERE ts > now() - interval '9 days';
+
+COMMIT;
