@@ -6,6 +6,8 @@ Polls Roblox's public web endpoints and writes to the Postgres schema in schema.
 
 Jobs (python collector.py <job>):
   init              Apply schema.sql to DATABASE_URL (alternative: psql "$DATABASE_URL" -f schema.sql)
+  probe-passes      Call the game-pass endpoints for the busiest tracked game and print what comes back,
+                    so a silent change in that API shows up as "0 passes" nowhere else.
   probe             Walk the charts (explore) API once, print every sort with its id, name, first-page
                     size and whether it paginates, plus the field names on a game entry. Writes nothing
                     to the database; saves probe_get_sorts.json.
@@ -19,6 +21,8 @@ Every job appends its log to logs/<job>-<YYYY-MM-DD>.log next to this script.
   promote           Apply the watchlist rules and launch-cohort labelling. Run after `sorts`.
   sample-controls   Pick N random games in a CCU band as the control population
                     (python collector.py sample-controls --n 300 --lo 200 --hi 2000).
+  passes            Refresh game passes for every tracked game now (about 10 minutes); the daily job
+                    otherwise refreshes a seventh of them each day.
 
 Settings come from environment variables, or from a file named secrets.txt or .env next to this
 script. In that file, a bare line starting with postgresql:// becomes DATABASE_URL; other lines
@@ -106,7 +110,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)   # one line per request is
 # ----------------------------------------------------------------------------
 GAMES_API = "https://games.roblox.com/v1/games"
 VOTES_API = "https://games.roblox.com/v1/games/votes"
-PASSES_API = "https://games.roblox.com/v1/games/{uid}/game-passes"
+PASSES_API = "https://apis.roblox.com/game-passes/v1/universes/{uid}/game-passes"   # games.roblox.com/v1/games/{id}/game-passes returns 404 since 2026
+PASSES_API_LEGACY = "https://games.roblox.com/v1/games/{uid}/game-passes"
 ICONS_API = "https://thumbnails.roblox.com/v1/games/icons"
 THUMBS_API = "https://thumbnails.roblox.com/v1/games/multiget/thumbnails"
 EXPLORE_SORTS = "https://apis.roblox.com/explore-api/v1/get-sorts"
@@ -121,6 +126,7 @@ BATCH = 50  # universe ids per multi-get call
 _SLOW = float(os.environ.get("RTDB_GAMES_INTERVAL_S", "3.0"))
 _CREATOR = float(os.environ.get("RTDB_CREATOR_INTERVAL_S", "10.0"))   # groups.roblox.com throttled at 3 s
 HOST_MIN_INTERVAL = {
+    "apis.roblox.com": 0.5,
     "games.roblox.com": _SLOW,
     "groups.roblox.com": _CREATOR,
     "users.roblox.com": _CREATOR,
@@ -350,18 +356,25 @@ def fetch_thumbnails(http: Http, ids: list[int]) -> dict[int, str]:
 
 
 def fetch_passes(http: Http, uid: int) -> list[dict]:
+    """Returns [{id, name, price}] with price None when the pass is not for sale."""
     passes: list[dict] = []
     cursor = None
     for _ in range(20):  # hard stop: 2,000 passes
-        params: dict = {"limit": 100, "sortOrder": "Asc"}
+        params: dict = {"limit": 100, "passView": "Full"}
         if cursor:
             params["cursor"] = cursor
         data = http.get_json(PASSES_API.format(uid=uid), params)
         if not data:
             break
-        passes.extend(data.get("data", []))
-        cursor = data.get("nextPageCursor")
-        if not cursor:
+        items = data.get("gamePasses") or data.get("data") or []
+        for p in items:
+            passes.append({
+                "id": p.get("id"),
+                "name": p.get("displayName") or p.get("name"),
+                "price": p.get("price") if p.get("isForSale", True) else None,
+            })
+        cursor = data.get("nextPageCursor") or data.get("cursor") or data.get("nextCursor")
+        if not cursor or not items:
             break
     return passes
 
@@ -663,6 +676,50 @@ def job_probe(conn, http: Http) -> int:
     return 0
 
 
+def job_passes(conn, http: Http) -> int:
+    """One-off / ad hoc: refresh game passes for every tracked game (the daily job only does a weekly rotation)."""
+    ts = run_ts()
+    ids = [u for u, *_ in _tracked(conn, "tracking_tier <> 'paused'")]
+    n_passes = 0
+    for i, uid in enumerate(ids, 1):
+        try:
+            passes = fetch_passes(http, uid)
+            record_passes(conn, uid, passes, ts)
+            n_passes += len(passes)
+        except Exception as e:
+            log.warning("passes failed for %s: %s", uid, e)
+        if i % 50 == 0:
+            conn.commit()
+            log.info("passes: %d/%d games, %d passes so far", i, len(ids), n_passes)
+    conn.commit()
+    log.info("passes: %d games, %d passes recorded; %d requests, %d throttled", len(ids), n_passes, http.requests, http.throttled)
+    return n_passes
+
+
+def job_probe_passes(conn, http: Http) -> int:
+    with conn.cursor() as cur:
+        cur.execute("""SELECT e.universe_id, e.name FROM experience e JOIN v_velocity v USING (universe_id)
+                       ORDER BY v.ccu_24h DESC NULLS LAST LIMIT 1""")
+        row = cur.fetchone()
+    if not row:
+        print("no tracked games yet"); return 0
+    uid, name = row
+    print(f"testing game-pass endpoints for {name!r} (universe {uid})")
+    for label, url, params in (
+        ("apis.roblox.com (current)", PASSES_API.format(uid=uid), {"limit": 100, "passView": "Full"}),
+        ("games.roblox.com (legacy)", PASSES_API_LEGACY.format(uid=uid), {"limit": 100, "sortOrder": "Asc"}),
+    ):
+        http._pace("games.roblox.com")
+        r = http.client.get(url, params=params)
+        body = r.text[:400].replace("\n", " ")
+        print(f"- {label}: HTTP {r.status_code}; body starts: {body}")
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*), count(DISTINCT universe_id) FROM gamepass")
+        n, g = cur.fetchone()
+    print(f"gamepass table: {n} passes across {g} games")
+    return 0
+
+
 def job_sorts(conn, http: Http) -> int:
     ts = run_ts()
     seen: dict[int, dict] = {}
@@ -918,7 +975,7 @@ def job_init(conn, http: Http, schema_path: str) -> int:
 # ----------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("job", choices=["init", "probe", "sorts", "stats", "daily", "promote", "sample-controls"])
+    ap.add_argument("job", choices=["init", "probe", "probe-passes", "sorts", "stats", "daily", "promote", "sample-controls", "passes"])
     ap.add_argument("--schema", default=os.path.join(BASE_DIR, "schema.sql"))
     ap.add_argument("--n", type=int, default=300, help="sample-controls: how many")
     ap.add_argument("--lo", type=int, default=200, help="sample-controls: min CCU")
@@ -948,6 +1005,8 @@ def main(argv: list[str] | None = None) -> int:
                     rows = job_init(conn, http, args.schema)
                 elif args.job == "probe":
                     rows = job_probe(conn, http)
+                elif args.job == "probe-passes":
+                    rows = job_probe_passes(conn, http)
                 elif args.job == "sorts":
                     rows = job_sorts(conn, http)
                 elif args.job == "stats":
@@ -956,15 +1015,17 @@ def main(argv: list[str] | None = None) -> int:
                     rows = job_daily(conn, http)
                 elif args.job == "promote":
                     rows = job_promote(conn, http)
+                elif args.job == "passes":
+                    rows = job_passes(conn, http)
                 else:
                     rows = job_sample_controls(conn, http, args.n, args.lo, args.hi)
             except Exception as e:
                 conn.rollback()
                 log.exception("%s failed", args.job)
-                if args.job not in ("init", "probe"):
+                if args.job not in ("init", "probe", "probe-passes"):
                     log_run(conn, args.job, started, False, 0, http.requests, repr(e)[:2000])
                 return 1
-            if args.job not in ("init", "probe"):
+            if args.job not in ("init", "probe", "probe-passes"):
                 log_run(conn, args.job, started, True, rows, http.requests, None)
     return 0
 

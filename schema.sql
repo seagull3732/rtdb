@@ -1,5 +1,5 @@
 -- =============================================================================
---  Roblox Trend Database (rtdb) — schema v0.6  (re-running this file is safe)
+--  Roblox Trend Database (rtdb) — schema v0.8  (re-running this file is safe)
 --  Target: PostgreSQL 14+ (Supabase free tier is fine). Apply with:
 --      psql "$DATABASE_URL" -f schema.sql        or        python collector.py init
 --  Design rules:
@@ -446,29 +446,31 @@ LEFT JOIN ctrl_with cw USING (feature_key, value_text)
 LEFT JOIN ctrl_tot  ct USING (feature_key)
 ORDER BY lift DESC NULLS LAST, p_hits DESC;
 
--- Breakout detector: games whose daily average CCU grew >=50% day-over-day to at least 300.
--- Used by the collector's `promote` job; also your daily "what just ignited" list.
-CREATE OR REPLACE VIEW v_growth_alerts AS
-WITH recent AS (                       -- only the last 3 days of snapshots: cheap even at scale
-    SELECT universe_id, (ts AT TIME ZONE 'UTC')::date AS day, avg(playing)::numeric(12,1) AS avg_ccu
+-- Breakout detector: last 24 hours vs the 24 hours before, rolling windows (calendar days bias with time of day).
+-- Fires when the last 24h averaged >= 300 players and >= 1.5x the previous 24h, which must cover at least 12 hours of samples.
+-- Column names are kept from v1 (day/prev_avg/avg_ccu) because the collector's promote job and the radar read them.
+DROP VIEW IF EXISTS v_growth_alerts CASCADE;   -- column types changed in v0.7; dependents are re-created below
+CREATE VIEW v_growth_alerts AS
+WITH w AS (
+    SELECT universe_id,
+           avg(playing)   FILTER (WHERE ts > now() - interval '24 hours')                                       AS avg_ccu,
+           avg(playing)   FILTER (WHERE ts BETWEEN now() - interval '48 hours' AND now() - interval '24 hours') AS prev_avg,
+           count(DISTINCT date_trunc('hour', ts)) FILTER (WHERE ts BETWEEN now() - interval '48 hours' AND now() - interval '24 hours') AS prev_hours
     FROM snapshot
-    WHERE ts > now() - interval '3 days' AND playing IS NOT NULL
-    GROUP BY 1, 2
-),
-d AS (
-    SELECT universe_id, day, avg_ccu,
-           lag(avg_ccu) OVER (PARTITION BY universe_id ORDER BY day) AS prev_avg
-    FROM recent
+    WHERE ts > now() - interval '48 hours' AND playing IS NOT NULL
+    GROUP BY universe_id
 )
-SELECT d.universe_id, e.name, d.day, d.prev_avg, d.avg_ccu,
-       (d.avg_ccu / NULLIF(d.prev_avg, 0))::numeric(8,2) AS growth,
+SELECT w.universe_id, e.name,
+       (now() AT TIME ZONE 'UTC')::date          AS day,
+       round(w.prev_avg)::numeric(12,1)          AS prev_avg,
+       round(w.avg_ccu)::numeric(12,1)           AS avg_ccu,
+       (w.avg_ccu / NULLIF(w.prev_avg, 0))::numeric(8,2) AS growth,
        e.created_at
-FROM d
+FROM w
 JOIN experience e USING (universe_id)
-WHERE d.day >= (now() AT TIME ZONE 'UTC')::date - 1
-  AND d.avg_ccu >= 300
-  AND d.prev_avg IS NOT NULL
-  AND d.avg_ccu >= 1.5 * d.prev_avg;
+WHERE w.avg_ccu >= 300
+  AND w.prev_hours >= 12
+  AND w.avg_ccu >= 1.5 * w.prev_avg;
 
 -- Wave analysis: new entrants per ISO week for each core-loop archetype, with their outcome.
 CREATE OR REPLACE VIEW v_archetype_entrants_weekly AS
@@ -545,7 +547,9 @@ WITH w AS (
            avg(playing) FILTER (WHERE ts BETWEEN now() - interval '8 days'   AND now() - interval '7 days')               AS ccu_7d_ago,
            avg(playing) FILTER (WHERE ts BETWEEN now() - interval '29 days'  AND now() - interval '28 days')              AS ccu_28d_ago,
            max(playing) FILTER (WHERE ts > now() - interval '7 days')                                                     AS peak_7d,
-           avg(playing) FILTER (WHERE ts > now() - interval '6 hours')                                                    AS ccu_6h
+           avg(playing) FILTER (WHERE ts > now() - interval '6 hours')                                                    AS ccu_6h,
+           avg(playing) FILTER (WHERE ts BETWEEN now() - interval '30 hours' AND now() - interval '24 hours')             AS ccu_6h_yesterday,
+           stddev_pop(playing) FILTER (WHERE ts > now() - interval '24 hours')                                            AS sd_24h
     FROM snapshot
     WHERE ts > now() - interval '29 days' AND playing IS NOT NULL
     GROUP BY universe_id
@@ -573,7 +577,9 @@ SELECT e.universe_id, e.name,
             WHEN w.ccu_24h / NULLIF(w.ccu_7d_ago, 0) - 1 > -0.40 THEN 'declining'
             ELSE 'collapsing' END                                         AS velocity_label,
        round(w.ccu_6h)::int                                              AS ccu_6h,
-       (w.ccu_6h / NULLIF(w.ccu_24h, 0))::numeric(6,2)                    AS momentum          -- <1 = fading within the day
+       (w.ccu_6h / NULLIF(w.ccu_24h, 0))::numeric(6,2)                    AS momentum,         -- <1 = fading within the day
+       (w.ccu_6h / NULLIF(w.ccu_6h_yesterday, 0) - 1)::numeric(8,3)       AS growth_same_hours, -- last 6h vs the same 6h yesterday: immune to the daily cycle
+       (w.sd_24h / NULLIF(w.ccu_24h, 0))::numeric(6,3)                     AS ccu_cv_24h         -- spread of the last 24h of samples; organic traffic is rarely below ~0.08
 FROM experience e
 JOIN w USING (universe_id)
 LEFT JOIN r USING (universe_id);
@@ -726,7 +732,9 @@ base AS (
     SELECT e.universe_id, e.name, e.created_at, v.ccu_24h, v.growth_1d, v.growth_7d, v.growth_28d,
            v.trending_rank_now, v.trending_rank_climb, v.velocity_label, v.momentum,
            (e.first_seen_at < now() - interval '7 days' OR e.created_at > now() - interval '60 days') AS history_ok,
+           v.growth_same_hours, v.ccu_cv_24h,
            (a.universe_id IS NOT NULL)                                                   AS t_alert,
+           (v.growth_same_hours >= 0.5 AND v.ccu_6h >= 300)                              AS t_same_hours,
            (f.first_on_major > now() - interval '24 hours'
               AND (e.first_seen_at < now() - interval '3 days' OR e.created_at > now() - interval '60 days')) AS t_chart,
            (v.trending_rank_climb >= 20)                                                 AS t_climb,
@@ -743,22 +751,30 @@ base AS (
 )
 SELECT universe_id, name, created_at, ccu_24h, growth_1d, growth_7d, growth_28d, trending_rank_now, trending_rank_climb, velocity_label,
        array_remove(ARRAY[
-           CASE WHEN t_alert                       THEN 'growth alert: daily players up 50%+ day-over-day' END,
+           CASE WHEN t_alert                       THEN 'growth alert: last 24h averaged 50%+ above the previous 24h' END,
+           CASE WHEN t_same_hours                  THEN 'same hours as yesterday: players up 50%+' END,
            CASE WHEN t_chart                       THEN 'new to a major chart (top 100) in the last 24h' END,
            CASE WHEN t_climb                       THEN 'climbed 20+ places on Top Trending this week' END,
            CASE WHEN t_double                      THEN 'doubled players in 7 days' END,
            CASE WHEN history_ok AND milestone IS NOT NULL THEN 'crossed ' || (milestone / 1000) || 'k players for the first time' END
        ], NULL) AS triggers,
        (ln(greatest(coalesce(ccu_24h, 1), 1))
-          * (1 + least(coalesce(greatest(growth_7d, 0), 0), 3) + 0.5 * least(coalesce(greatest(growth_1d, 0), 0), 3))
+          * (1 + least(coalesce(greatest(growth_7d, 0), 0), 3)
+               + 0.5 * least(coalesce(greatest(coalesce(growth_same_hours, growth_1d), 0), 0), 3))
           * least(1.0, coalesce(momentum, 1) + 0.25)                       -- a spike that is already fading ranks lower
         + CASE WHEN t_chart THEN 3 ELSE 0 END
         + least(coalesce(greatest(trending_rank_climb, 0), 0), 50) / 10.0
-        + CASE WHEN t_alert THEN 2 ELSE 0 END)::numeric(8,2) AS heat,
-       momentum
+        + CASE WHEN t_alert THEN 2 ELSE 0 END
+        + CASE WHEN t_same_hours THEN 2 ELSE 0 END)::numeric(8,2) AS heat,
+       momentum, growth_same_hours, ccu_cv_24h
 FROM base
-WHERE (t_alert OR t_chart OR t_climb OR t_double OR (history_ok AND milestone IS NOT NULL))
+WHERE (t_alert OR t_same_hours OR t_chart OR t_climb OR t_double OR (history_ok AND milestone IS NOT NULL))
   AND coalesce(momentum, 1) >= 0.4                                        -- skip spikes that are already over
 ORDER BY heat DESC;
 
 COMMIT;
+
+
+-- v0.7 cleanup: earlier auto runs wrote 0 for "no earlier game by this creator in the database"; that is unknown, not zero.
+DELETE FROM feature WHERE feature_key = 'creator_prior_peak_ccu' AND coder = 'auto' AND value_num = 0
+  AND evidence LIKE 'no earlier experience%';

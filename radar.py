@@ -52,8 +52,11 @@ Write an evidence-weighted brief. Rules:
   a platform event, a name/thumbnail change, or player counts that look bot-like (flat plateaus, visits inconsistent
   with concurrency).
 - If the dossier cannot explain the surge, say so plainly instead of inventing a story.
+- The dossier includes growth_same_hours (the last 6 hours vs the same 6 hours yesterday). Use it to separate a real
+  rise from the daily cycle before anything else; verdict daily_cycle_or_artifact when that is the best explanation.
 Return ONE JSON object and nothing else:
-{"headline": "<= 15 words", "what_it_is": "1-2 sentences", "whats_happening": "2-3 sentences with numbers",
+{"verdict": "one of: real_breakout | event_spike | daily_cycle_or_artifact | unclear",
+ "headline": "<= 15 words", "what_it_is": "1-2 sentences", "whats_happening": "2-3 sentences with numbers",
  "distinct_traits": [{"trait": "...", "value": "...", "why_notable": "..."}],
  "likely_reasons": [{"reason": "...", "evidence": "...", "confidence": 0.0}],
  "wave_context": "first mover / fast follower / late entrant, with the numbers",
@@ -87,7 +90,8 @@ def build_dossier(conn, uid: int, cand: dict, lift: dict) -> dict:
         SELECT e.universe_id, e.name, e.root_place_id, e.created_at, (now()::date - e.created_at::date) AS age_days,
                e.genre_l1, e.genre_l2, e.max_players, e.age_rating, e.creator_type, e.creator_name, c.member_count AS creator_group_members,
                e.first_seen_at, e.population, e.launch_cohort, t.tier, cat.category,
-               v.ccu_24h, v.growth_1d, v.growth_7d, v.growth_28d, v.peak_7d, v.trending_rank_now, v.trending_rank_climb, v.velocity_label,
+               v.ccu_24h, v.ccu_6h, v.momentum, v.growth_same_hours, v.ccu_cv_24h, v.growth_1d, v.growth_7d, v.growth_28d, v.peak_7d,
+               v.trending_rank_now, v.trending_rank_climb, v.velocity_label,
                p.peak_max_ccu AS peak_so_far, p.peak_day, r.like_ratio, r.favourites_per_1k_visits, r.visits, r.staying_power_d8_28, r.half_life_days
         FROM experience e
         LEFT JOIN creator c ON c.creator_type = e.creator_type AND c.creator_id = e.creator_id
@@ -100,7 +104,10 @@ def build_dossier(conn, uid: int, cand: dict, lift: dict) -> dict:
                             GROUP BY sort_id ORDER BY best_position""", (uid,))
     chart_first = q(conn, """SELECT sort_id, min(ts) AS first_seen_on_sort FROM chart_position
                              WHERE universe_id = %s AND NOT is_sponsored GROUP BY sort_id ORDER BY 2""", (uid,))
-    daily = q(conn, """SELECT day, avg_ccu, max_ccu FROM v_daily_ccu WHERE universe_id = %s AND day > current_date - 21 ORDER BY day""", (uid,))
+    daily = q(conn, """SELECT day, avg_ccu, max_ccu, (day = (now() AT TIME ZONE 'UTC')::date) AS partial_day
+                       FROM v_daily_ccu WHERE universe_id = %s AND day > current_date - 21 ORDER BY day""", (uid,))
+    hourly = q(conn, """SELECT date_trunc('hour', ts) AS hour, round(avg(playing)) AS avg_players
+                        FROM snapshot WHERE universe_id = %s AND ts > now() - interval '48 hours' GROUP BY 1 ORDER BY 1""", (uid,))
     changes = q(conn, """
         SELECT 'name' AS kind, n.name AS value, n.first_seen_at FROM name_history n JOIN experience e USING (universe_id)
          WHERE n.universe_id = %s AND n.first_seen_at > e.first_seen_at + interval '1 hour' AND n.first_seen_at > now() - interval '14 days'
@@ -124,10 +131,11 @@ def build_dossier(conn, uid: int, cand: dict, lift: dict) -> dict:
     notable = []
     for t in traits:
         row = lift.get((t["feature_key"], t["value"]))
-        if row and row["n_hits"] >= 5 and row["n_control"] >= 10:
+        if row and row["n_hits"] >= 5 and row["n_control"] >= 10 and row["lift"] is not None and (row["lift"] >= 1.3 or row["lift"] <= 0.7):
             notable.append({"trait": t["feature_key"], "value": t["value"], "share_of_hits": row["p_hits"],
-                            "share_of_controls": row["p_control"], "lift": row["lift"]})
-    notable.sort(key=lambda r: -(r["lift"] or 0))
+                            "share_of_controls": row["p_control"], "lift": row["lift"],
+                            "direction": "over-represented among hits" if row["lift"] >= 1.3 else "under-represented among hits"})
+    notable.sort(key=lambda r: -abs((r["lift"] or 1) - 1))
     core_loop = trait_map.get("core_loop")
     wave = {}
     if core_loop:
@@ -147,6 +155,18 @@ def build_dossier(conn, uid: int, cand: dict, lift: dict) -> dict:
         FROM experience o LEFT JOIN v_peak p USING (universe_id)
         WHERE o.creator_type = %s AND o.creator_id = (SELECT creator_id FROM experience WHERE universe_id = %s) AND o.universe_id <> %s
         ORDER BY p.peak_max_ccu DESC NULLS LAST LIMIT 6""", (head["creator_type"], uid, uid))
+    bench = q(conn, """
+        WITH pop AS (
+            SELECT universe_id, like_ratio, favourites_per_1k_visits,
+                   percent_rank() OVER (ORDER BY like_ratio)                AS like_pct,
+                   percent_rank() OVER (ORDER BY favourites_per_1k_visits)  AS fav_pct
+            FROM v_retention_proxy WHERE like_ratio IS NOT NULL
+        )
+        SELECT (SELECT count(*) FROM pop) AS games_compared,
+               (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY like_ratio) FROM pop)               AS median_like_ratio,
+               (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY favourites_per_1k_visits) FROM pop) AS median_favourites_per_1k_visits,
+               p.like_pct AS this_game_like_ratio_percentile, p.fav_pct AS this_game_favourites_percentile
+        FROM pop p WHERE p.universe_id = %s""", (uid,))
     cohort = q(conn, """
         SELECT median_ccu, games FROM v_cohort_curve
         WHERE cohort_month = date_trunc('month', %s::timestamptz)::date AND day_n = %s""",
@@ -155,16 +175,20 @@ def build_dossier(conn, uid: int, cand: dict, lift: dict) -> dict:
         "as_of": datetime.now(timezone.utc).isoformat(),
         "triggers": cand.get("triggers"), "heat": cand.get("heat"),
         "game": head, "charts_last_24h": charts_now, "first_appearance_per_chart": chart_first,
-        "daily_players_last_21_days": daily, "changes_last_14_days": changes, "game_passes_on_sale": passes,
+        "daily_players_last_21_days": daily, "hourly_players_last_48h": hourly,
+        "changes_last_14_days": changes, "game_passes_on_sale": passes,
         "traits": {t["feature_key"]: {"value": t["value"], "coder": t["coder"], "note": (t["evidence"] or "")[:120]} for t in traits},
-        "traits_over_represented_among_hits": notable[:10],
+        "traits_with_meaningful_lift": notable[:10],
         "wave_context_same_core_loop": wave,
         "creators_other_games": creator_other,
         "cohort_baseline_same_age": (cohort[0] if cohort else "no cohort baseline yet (needs more history)"),
+        "reception_benchmarks_all_tracked_games": (bench[0] if bench else None),
         "data_caveats": ["player counts are concurrent users sampled every 30-60 min; they can be inflated by bots",
                          "retention is a proxy (staying power), not measured retention",
                          "the charts both reflect and cause growth; a chart entry is not an independent signal",
-                         "this database started collecting on 2026-09-29; older history is partial"],
+                         "this database started collecting on 2026-09-29; 'first time' triggers are only used for games watched 7+ days or created < 60 days ago",
+                         "a day marked partial_day covers only the hours elapsed so far today (UTC)",
+                         "ccu_cv_24h is the spread of the last 24h of player samples relative to their mean; organic audiences with a daily cycle rarely sit below ~0.08, so a flat line (very low value) over a full day deserves suspicion"],
     }
     return jsonable(dossier)
 
@@ -177,11 +201,12 @@ def render_markdown(d: dict, r: dict) -> str:
     def pct(x):
         return "n/a" if x is None else f"{x * 100:+.0f}%"
     lines = [f"### {g['name']}  —  {r.get('headline', '')}",
+             f"**Verdict: {str(r.get('verdict', 'unclear')).replace('_', ' ')}** (confidence {r.get('overall_confidence')})",
              f"*{g.get('category') or 'uncategorised'} · {g.get('genre_l1') or ''} · created {str(g.get('created_at') or '')[:10]} ({g.get('age_days')} days old) · "
              f"creator: {g.get('creator_name')} ({g.get('creator_type')})*",
              "",
-             f"**Players now:** {g.get('ccu_24h')} avg last 24h · 1d {pct(g.get('growth_1d'))} · 7d {pct(g.get('growth_7d'))} · 28d {pct(g.get('growth_28d'))} · "
-             f"peak so far {g.get('peak_so_far')} · like ratio {g.get('like_ratio')}",
+             f"**Players now:** {g.get('ccu_24h')} avg last 24h · same hours vs yesterday {pct(g.get('growth_same_hours'))} · 1d {pct(g.get('growth_1d'))} · "
+             f"7d {pct(g.get('growth_7d'))} · 28d {pct(g.get('growth_28d'))} · peak so far {g.get('peak_so_far')} · like ratio {g.get('like_ratio')}",
              f"**Why it tripped the radar:** {', '.join(d.get('triggers') or [])} (heat {d.get('heat')})",
              "",
              f"**What it is.** {r.get('what_it_is', '')}",
@@ -210,10 +235,9 @@ def render_markdown(d: dict, r: dict) -> str:
 
 def brief_one(http, api_key: str, model: str, dossier: dict) -> tuple[dict, dict]:
     prompt = "DOSSIER (JSON):\n" + json.dumps(dossier, ensure_ascii=False, default=str)
-    text, usage = F.call_claude(http, api_key, model, prompt, None, system=SYSTEM_PROMPT, max_tokens=1800)
-    cleaned = text.strip()
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    return json.loads(cleaned[start:end + 1]), usage
+    # Sonnet 5.5 thinks before it answers and the thinking counts against this budget, so it is generous;
+    # ask_json retries with double the budget if a reply still comes back truncated.
+    return F.ask_json(http, api_key, model, prompt, None, system=SYSTEM_PROMPT, max_tokens=8000)
 
 
 def post_discord(webhook: str, text: str) -> None:
@@ -228,6 +252,15 @@ def post_discord(webhook: str, text: str) -> None:
 def digest_text(day: date, items: list[dict]) -> str:
     out = [f"# Explosive radar — {day.isoformat()}", "",
            f"{len(items)} game(s) tripped the radar. Ordered by heat. Reasons are evidence-ranked hypotheses, not proven causes.", ""]
+    if items and all("report" in it for it in items):
+        out += ["| # | Game | Verdict | Players (24h) | Same hours vs yesterday | Flatness | Heat | Headline |", "|---|---|---|---|---|---|---|---|"]
+        for i, it in enumerate(items, 1):
+            g, rep = it["dossier"]["game"], it["report"]
+            gsh, cv = g.get("growth_same_hours"), g.get("ccu_cv_24h")
+            flat = "n/a" if cv is None else ("FLAT" if cv < 0.08 else f"{cv:.2f}")
+            out.append(f"| {i} | {g['name']} | {str(rep.get('verdict', 'unclear')).replace('_', ' ')} | {g.get('ccu_24h')} | "
+                       f"{'n/a' if gsh is None else f'{gsh * 100:+.0f}%'} | {flat} | {it['dossier'].get('heat')} | {rep.get('headline', '')} |")
+        out.append("")
     for it in items:
         out.append(it["markdown"])
         out.append("\n---\n")
@@ -239,7 +272,7 @@ def short_digest(day: date, items: list[dict]) -> str:
     for it in items[:6]:
         g, r = it["dossier"]["game"], it["report"]
         top = (r.get("likely_reasons") or [{}])[0].get("reason", "")
-        out.append(f"• **{g['name']}** — {g.get('ccu_24h')} players, 1d {g.get('growth_1d')}, 7d {g.get('growth_7d')} — {r.get('headline', '')} — top reason: {top}")
+        out.append(f"• **{g['name']}** [{str(r.get('verdict', 'unclear')).replace('_', ' ')}] — {g.get('ccu_24h')} players, same hours {g.get('growth_same_hours')} — {r.get('headline', '')} — top reason: {top}")
     out.append("Full briefs: reports/radar-" + day.isoformat() + ".md in the repo.")
     return "\n".join(out)
 
@@ -275,6 +308,7 @@ def job_run(conn, n: int, dry_run: bool, model: str, day: date) -> int:
             print(json.dumps(dossier, indent=1, default=str)[:6000], "\n...\n", md)
             return 0
     with conn.cursor() as cur:
+        cur.execute("DELETE FROM radar_report WHERE report_date = %s", (day,))   # a re-run replaces the day's digest
         for it in items:
             cur.execute("""INSERT INTO radar_report (universe_id, report_date, heat, triggers, dossier, report, markdown, model)
                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
@@ -297,11 +331,11 @@ def job_run(conn, n: int, dry_run: bool, model: str, day: date) -> int:
 
 
 def job_show(conn, day: date) -> int:
-    rows = q(conn, "SELECT markdown FROM radar_report WHERE report_date = %s ORDER BY heat DESC", (day,))
+    rows = q(conn, "SELECT dossier, report, markdown FROM radar_report WHERE report_date = %s ORDER BY heat DESC", (day,))
     if not rows:
         print(f"no radar reports for {day}")
         return 0
-    print(digest_text(day, [{"markdown": r["markdown"]} for r in rows]))
+    print(digest_text(day, [{"dossier": r["dossier"], "report": r["report"], "markdown": r["markdown"]} for r in rows]))
     return len(rows)
 
 
