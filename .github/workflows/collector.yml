@@ -9,14 +9,17 @@ on:
     - cron: "*/30 * * * *"   # stats, every 30 minutes
     - cron: "7 * * * *"      # sorts + promote, hourly
     - cron: "20 3 * * *"     # daily refresh
+    - cron: "40 4 * * 1"     # weekly feature coding (auto traits, then the LLM pass if a key is set)
+    - cron: "0 2 * * 0"      # weekly backup → release "backups" (encrypted when BACKUP_PASSPHRASE is set)
+    - cron: "30 2 1 * *"     # monthly archive of last month's snapshot + chart_position rows
     - cron: "0 12 * * 0"     # weekly heartbeat commit (keeps the schedule from being paused)
   workflow_dispatch:
     inputs:
       job:
-        description: "Collector job to run by hand"
+        description: "Job to run by hand"
         type: choice
         default: stats
-        options: [stats, sorts, promote, daily, sample-controls, probe]
+        options: [stats, sorts, promote, daily, sample-controls, probe, code-auto, code-llm, backup, archive-month]
 
 permissions:
   contents: write            # only used by the heartbeat commit
@@ -33,6 +36,7 @@ jobs:
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       RTDB_CONTACT: ${{ secrets.RTDB_CONTACT }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +66,36 @@ jobs:
       - name: other manual jobs
         if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["promote","sample-controls","probe"]'), inputs.job)
         run: python collector.py ${{ inputs.job }}
+
+      - name: weekly feature coding
+        if: github.event.schedule == '40 4 * * 1' || inputs.job == 'code-auto' || inputs.job == 'code-llm'
+        run: |
+          python code_features.py auto
+          if [ "${{ inputs.job }}" != "code-auto" ]; then python code_features.py llm --limit 300; fi
+
+      - name: backup / archive
+        if: github.event.schedule == '0 2 * * 0' || github.event.schedule == '30 2 1 * *' || inputs.job == 'backup' || inputs.job == 'archive-month'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -e
+          if [ "${{ github.event.schedule }}" = "30 2 1 * *" ] || [ "${{ inputs.job }}" = "archive-month" ]; then
+            python archive.py monthly --out backup_out
+          else
+            python archive.py weekly --out backup_out
+          fi
+          gh release view backups >/dev/null 2>&1 || gh release create backups --title "rtdb backups" \
+            --notes "Automated database exports (weekly state + permanent monthly archives). Encrypted with gpg when BACKUP_PASSPHRASE is set: gpg --decrypt FILE.gpg > FILE, then python archive.py restore FILE."
+          for f in backup_out/*; do
+            if [ -n "$BACKUP_PASSPHRASE" ]; then
+              gpg --batch --yes --symmetric --cipher-algo AES256 --passphrase "$BACKUP_PASSPHRASE" -o "$f.gpg" "$f"
+              f="$f.gpg"
+            else
+              echo "::warning::BACKUP_PASSPHRASE is not set — uploading unencrypted backups to a public release"
+            fi
+            gh release upload backups "$f" --clobber
+          done
 
       - name: weekly heartbeat commit
         if: github.event.schedule == '0 12 * * 0'
