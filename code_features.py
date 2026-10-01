@@ -51,6 +51,37 @@ import collector as C   # reuses settings loading, the paced HTTP client and BAS
 
 log = logging.getLogger("rtdb.code")
 CODEBOOK_VERSION = "v1"
+KEEPALIVE = dict(keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5, connect_timeout=30)
+
+
+class Db:
+    """One connection with TCP keepalives, and automatic reconnect-and-retry for long jobs."""
+
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+        self.conn = psycopg.connect(dsn, **KEEPALIVE)
+
+    def retry(self, fn, *args, **kwargs):
+        for attempt in range(4):
+            try:
+                if self.conn.closed:
+                    self.conn = psycopg.connect(self.dsn, **KEEPALIVE)
+                return fn(self.conn, *args, **kwargs)
+            except psycopg.OperationalError as e:
+                log.warning("database connection lost (%s); reconnecting in %ds", str(e).splitlines()[0], 5 * (attempt + 1))
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                time.sleep(5 * (attempt + 1))
+                self.conn = psycopg.connect(self.dsn, **KEEPALIVE)
+        raise RuntimeError("database unreachable after repeated reconnects")
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = os.environ.get("RTDB_LLM_MODEL", "claude-sonnet-5-5")
 
@@ -456,7 +487,8 @@ def parse_answer(text: str, codebook: dict, fields: list[str]) -> tuple[list[tup
     return rows, low
 
 
-def job_llm(conn, limit: int, recode: bool, vision: bool, dry_run: bool, model: str, missing: str | None = None) -> int:
+def job_llm(db: Db, limit: int, recode: bool, vision: bool, dry_run: bool, model: str, missing: str | None = None) -> int:
+    conn = db.conn
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         log.warning("ANTHROPIC_API_KEY is not set (add ANTHROPIC_API_KEY=... to secrets.txt); skipping the LLM pass")
@@ -490,7 +522,7 @@ def job_llm(conn, limit: int, recode: bool, vision: bool, dry_run: bool, model: 
             for r in rows:
                 print("  ", r)
             return 0
-        n = write_features(conn, [(uid, k, vt, vn, f"model={model}; {ev}") for k, vt, vn, ev in rows], coder="llm")
+        n = db.retry(write_features, [(uid, k, vt, vn, f"model={model}; {ev}") for k, vt, vn, ev in rows], coder="llm")
         written += n
         coded += 1
         log.info("llm %3d/%d %-40s %2d values%s", i, len(games), name[:40], n, f", second look: {', '.join(low)}" if low else "")
@@ -638,15 +670,18 @@ def main(argv: list[str] | None = None) -> int:
         print("usage: python code_features.py import FILE.csv --coder XX", file=sys.stderr)
         return 2
 
-    with psycopg.connect(dsn) as conn:
+    db = Db(dsn)
+    try:
         if args.job == "auto":
-            job_auto(conn)
+            db.retry(job_auto)
         elif args.job == "llm":
-            job_llm(conn, args.limit, args.recode, not args.no_vision, args.dry_run, args.model, args.missing)
+            job_llm(db, args.limit, args.recode, not args.no_vision, args.dry_run, args.model, args.missing)
         elif args.job == "queue":
-            job_queue(conn, args.n, args.out)
+            db.retry(job_queue, args.n, args.out)
         else:
-            job_import(conn, args.path, args.coder)
+            db.retry(job_import, args.path, args.coder)
+    finally:
+        db.close()
     return 0
 
 

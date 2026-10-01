@@ -942,7 +942,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         http = Http()
         started = datetime.now(timezone.utc)
-        with psycopg.connect(dsn) as conn:
+        with psycopg.connect(dsn, keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5, connect_timeout=30) as conn:
             try:
                 if args.job == "init":
                     rows = job_init(conn, http, args.schema)
