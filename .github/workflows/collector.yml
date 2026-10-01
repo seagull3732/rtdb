@@ -10,6 +10,7 @@ on:
     - cron: "7 * * * *"      # sorts + promote, hourly
     - cron: "20 3 * * *"     # daily refresh
     - cron: "40 4 * * 1"     # weekly feature coding (auto traits, then the LLM pass if a key is set)
+    - cron: "0 14 * * *"     # daily explosive radar (07:00 Pacific); briefs committed to reports/
     - cron: "0 2 * * 0"      # weekly backup → release "backups" (encrypted when BACKUP_PASSPHRASE is set)
     - cron: "30 2 1 * *"     # monthly archive of last month's snapshot + chart_position rows
     - cron: "0 12 * * 0"     # weekly heartbeat commit (keeps the schedule from being paused)
@@ -19,7 +20,7 @@ on:
         description: "Job to run by hand"
         type: choice
         default: stats
-        options: [stats, sorts, promote, daily, sample-controls, probe, code-auto, code-llm, backup, archive-month]
+        options: [stats, sorts, promote, daily, sample-controls, probe, code-auto, code-llm, radar, backup, archive-month]
 
 permissions:
   contents: write            # only used by the heartbeat commit
@@ -37,6 +38,7 @@ jobs:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       RTDB_CONTACT: ${{ secrets.RTDB_CONTACT }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      RTDB_DISCORD_WEBHOOK: ${{ secrets.RTDB_DISCORD_WEBHOOK }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,6 +74,20 @@ jobs:
         run: |
           python code_features.py auto
           if [ "${{ inputs.job }}" != "code-auto" ]; then python code_features.py llm --limit 300; fi
+
+      - name: explosive radar
+        if: github.event.schedule == '0 14 * * *' || inputs.job == 'radar'
+        run: |
+          set -e
+          python radar.py run
+          if ls reports/*.md >/dev/null 2>&1; then
+            git config user.name "rtdb-bot"
+            git config user.email "rtdb-bot@users.noreply.github.com"
+            git add reports
+            git commit -m "radar: $(date -u +%F)" || exit 0
+            git pull --rebase --autostash origin main || true
+            git push
+          fi
 
       - name: backup / archive
         if: github.event.schedule == '0 2 * * 0' || github.event.schedule == '30 2 1 * *' || inputs.job == 'backup' || inputs.job == 'archive-month'
