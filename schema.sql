@@ -1,5 +1,5 @@
 -- =============================================================================
---  Roblox Trend Database (rtdb) — schema v0.10  (re-running this file is safe)
+--  Roblox Trend Database (rtdb) — schema v0.13  (re-running this file is safe)
 --  Target: PostgreSQL 14+ (Supabase free tier is fine). Apply with:
 --      psql "$DATABASE_URL" -f schema.sql        or        python collector.py init
 --  Design rules:
@@ -844,5 +844,135 @@ SELECT round(coalesce(ext.now6, basket.now6))::bigint                           
        CASE WHEN ext.now6 IS NOT NULL THEN 'external Roblox-wide feed'
             ELSE 'balanced basket of ' || basket.games_same_hours || ' tracked games (same-hours) / ' || basket.games_7d || ' (7-day)' END AS basis
 FROM ext, basket;
+
+COMMIT;
+
+-- =============================================================================
+-- 12. Opportunity engine (schema v0.11)
+-- =============================================================================
+
+BEGIN;
+
+-- One row per archetype (core loop x primary category) with everything the opportunity engine scores.
+-- All medians ignore NULLs; the *_n columns say how many games each number rests on.
+CREATE OR REPLACE VIEW v_archetype_metrics AS
+WITH g AS (
+    SELECT e.universe_id, e.created_at, e.population,
+           coalesce(c.core_loop, 'uncoded') AS core_loop, c.category,
+           coalesce(c.core_loop, 'uncoded') || ' / ' || c.category AS archetype,
+           t.tier, t.peak_max_ccu,
+           r.staying_power_d8_28, r.half_life_days, r.like_ratio, r.favourites_per_1k_visits,
+           v.ccu_24h, v.growth_7d, v.growth_28d, e.max_players
+    FROM experience e
+    JOIN v_category c USING (universe_id)
+    LEFT JOIN v_tier t USING (universe_id)
+    LEFT JOIN v_retention_proxy r USING (universe_id)
+    LEFT JOIN v_velocity v USING (universe_id)
+    WHERE e.tracking_tier <> 'paused'
+),
+trending AS (
+    SELECT g.archetype, count(DISTINCT cp.universe_id) AS trending_slots
+    FROM chart_position cp JOIN g USING (universe_id)
+    WHERE cp.sort_id = 'top-trending' AND NOT cp.is_sponsored AND cp.position <= 100
+      AND cp.ts > now() - interval '24 hours'
+    GROUP BY g.archetype
+)
+SELECT g.archetype, g.core_loop, g.category,
+       count(*)                                                                              AS games,
+       count(*) FILTER (WHERE g.tier IN ('breakout','hit'))                                   AS hits,
+       count(*) FILTER (WHERE g.tier = 'breakout')                                            AS breakouts,
+       (count(*) FILTER (WHERE g.tier IN ('breakout','hit')))::numeric / NULLIF(count(*), 0)  AS hit_rate,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY g.peak_max_ccu)                            AS median_peak,
+       sum(g.ccu_24h)                                                                         AS players_now,
+       -- longevity
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY g.staying_power_d8_28)                     AS median_staying_power,
+       count(g.staying_power_d8_28)                                                           AS staying_power_n,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY g.half_life_days)                          AS median_half_life_days,
+       count(g.half_life_days)                                                                AS half_life_n,
+       -- saturation
+       count(*) FILTER (WHERE g.created_at > now() - interval '30 days')                       AS entrants_30d,
+       count(*) FILTER (WHERE g.created_at > now() - interval '90 days')                       AS entrants_90d,
+       count(*) FILTER (WHERE g.created_at BETWEEN now() - interval '180 days' AND now() - interval '90 days') AS entrants_prev_90d,
+       count(*) FILTER (WHERE g.created_at > now() - interval '90 days' AND g.peak_max_ccu >= 20000)  AS entrants_90d_hits,
+       count(*) FILTER (WHERE g.created_at > now() - interval '90 days' AND g.peak_max_ccu >= 2000)   AS entrants_90d_2k,
+       -- behaviour proxies
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY g.like_ratio)                              AS median_like_ratio,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY g.favourites_per_1k_visits)                AS median_fav_per_1k,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY g.max_players)                             AS median_server_size,
+       -- trend
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY g.growth_7d)                               AS median_growth_7d,
+       count(g.growth_7d)                                                                     AS growth_7d_n,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY g.growth_28d)                              AS median_growth_28d,
+       coalesce(max(tr.trending_slots), 0)                                                    AS trending_top100_slots,
+       min(g.created_at)                                                                      AS oldest_game,
+       max(g.created_at)                                                                      AS newest_game
+FROM g
+LEFT JOIN trending tr USING (archetype)
+GROUP BY g.archetype, g.core_loop, g.category
+ORDER BY players_now DESC NULLS LAST;
+
+CREATE TABLE IF NOT EXISTS opportunity_report (
+    run_date     DATE NOT NULL,
+    rank         INT NOT NULL,
+    archetype    TEXT NOT NULL,
+    score        NUMERIC,
+    components   JSONB,                      -- each scored input and the data behind it
+    brief        JSONB,                      -- the structured design brief
+    markdown     TEXT,
+    model        TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_date, rank)
+);
+
+COMMIT;
+
+
+-- v0.12: multi-value traits (play_mode, progression_type) are stored as sorted pipe-joined tokens, so 'pve|coop' and
+-- 'coop|pve' are the same value. Normalise any rows written before this rule existed.
+UPDATE feature f
+SET value_text = (SELECT string_agg(tok, '|' ORDER BY tok) FROM unnest(string_to_array(f.value_text, '|')) AS tok)
+FROM codebook c
+WHERE c.feature_key = f.feature_key AND c.value_type = 'multi' AND f.value_text LIKE '%|%'
+  AND f.value_text <> (SELECT string_agg(tok, '|' ORDER BY tok) FROM unnest(string_to_array(f.value_text, '|')) AS tok);
+
+-- =============================================================================
+-- 13. Game idea agent and the knowledge base (schema v0.13)
+-- =============================================================================
+
+BEGIN;
+
+-- Lessons: what we learned, from whom, and which agent should act on it. Read by every agent before it acts.
+CREATE TABLE IF NOT EXISTS lesson (
+    id           SERIAL PRIMARY KEY,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source       TEXT NOT NULL,                 -- 'human' | 'performance_agent' | 'scoring_agent' | 'idea_agent'
+    universe_id  BIGINT REFERENCES experience(universe_id),   -- the game it came from, if any
+    archetype    TEXT,                          -- 'core_loop / Category' or NULL for general
+    owner_agent  TEXT NOT NULL,                 -- 'idea' | 'scoring' | 'supervisor' | 'lead_dev' | 'team' | 'all'
+    pattern      TEXT NOT NULL,                 -- the lesson, one or two sentences
+    evidence     TEXT,                          -- the numbers or events behind it
+    confidence   NUMERIC,                       -- 0..1
+    status       TEXT NOT NULL DEFAULT 'active' -- 'active' | 'retired'
+);
+CREATE INDEX IF NOT EXISTS lesson_active_idx ON lesson (status, owner_agent);
+
+-- Concepts proposed by the idea agent, moving through the studio's statuses.
+CREATE TABLE IF NOT EXISTS concept (
+    id              SERIAL PRIMARY KEY,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    run_date        DATE NOT NULL,
+    archetype       TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    hook            TEXT,
+    body            JSONB NOT NULL,             -- the full concept: features, rewards, declared trait profile, scope, risks
+    markdown        TEXT,
+    model           TEXT,
+    status          TEXT NOT NULL DEFAULT 'proposed',  -- proposed | approved | rejected | scored | in_production | launched | killed | scaled
+    status_note     TEXT,
+    status_at       TIMESTAMPTZ,
+    score           JSONB,                      -- filled by the scoring agent
+    universe_id     BIGINT REFERENCES experience(universe_id)   -- once a game exists for it
+);
+CREATE INDEX IF NOT EXISTS concept_status_idx ON concept (status, run_date);
 
 COMMIT;
