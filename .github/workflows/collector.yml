@@ -12,6 +12,7 @@ on:
     - cron: "40 4 * * 1"     # weekly feature coding (auto traits, then the LLM pass if a key is set)
     - cron: "0 14 * * *"     # daily explosive radar (07:00 Pacific); briefs committed to reports/
     - cron: "30 15 * * 1"    # weekly opportunity engine (Mondays, after the radar); 3 briefs committed to reports/
+    - cron: "0 16 * * 1"     # weekly game idea agent (Mondays, after the opportunities); concepts committed to reports/
     - cron: "0 2 * * 0"      # weekly backup → release "backups" (encrypted when BACKUP_PASSPHRASE is set)
     - cron: "30 2 1 * *"     # monthly archive of last month's snapshot + chart_position rows
     - cron: "0 12 * * 0"     # weekly heartbeat commit (keeps the schedule from being paused)
@@ -21,7 +22,7 @@ on:
         description: "Job to run by hand"
         type: choice
         default: stats
-        options: [stats, sorts, promote, daily, sample-controls, probe, passes, platform-ccu, code-auto, code-llm, radar, opportunity, backup, archive-month, purge-public-reports]
+        options: [stats, sorts, promote, daily, sample-controls, probe, passes, platform-ccu, code-auto, code-llm, radar, opportunity, ideas, backup, archive-month, purge-public-reports]
 
 permissions:
   contents: write            # only used by the heartbeat commit
@@ -46,6 +47,8 @@ jobs:
       RTDB_RADAR_N: ${{ vars.RTDB_RADAR_N || '12' }}                       # briefs per daily radar run
       RTDB_RADAR_MODEL: ${{ vars.RTDB_RADAR_MODEL || 'claude-sonnet-5-5' }} # e.g. claude-haiku-4-5-20251001 for ~1/3 the cost
       RTDB_OPP_TOP: ${{ vars.RTDB_OPP_TOP || '3' }}                         # briefs per weekly opportunity run
+      RTDB_IDEAS_ARCHETYPES: ${{ vars.RTDB_IDEAS_ARCHETYPES || '3' }}       # archetypes the idea agent works on each week
+      RTDB_IDEAS_PER: ${{ vars.RTDB_IDEAS_PER || '3' }}                     # concepts per archetype
     steps:
       - uses: actions/checkout@v4
 
@@ -79,7 +82,11 @@ jobs:
               out += [f"- [{os.path.basename(f)}]({os.path.basename(f)})" for f in files[:60]] or ["- none yet"]
               return out + [""]
           lines = ["# rtdb reports", "", "Newest first. Opportunity reports are design briefs for the best-scoring archetypes; radar reports are daily briefs on games that ignited.", ""]
-          lines += section("Opportunities", "opportunities-*.md") + section("Radar", "radar-*.md")
+          if os.path.exists(os.path.join(d, "concepts_log.md")):
+              lines += ["**[Concepts log — every concept the idea agent has proposed, with status](concepts_log.md)**", ""]
+          if os.path.exists(os.path.join(d, "ideas_log.md")):
+              lines += ["**[Ideas log — every opportunity brief's idea, one line each](ideas_log.md)**", ""]
+          lines += section("Concepts (idea agent)", "concepts-*.md") + section("Opportunities", "opportunities-*.md") + section("Radar", "radar-*.md")
           open(os.path.join(d, "README.md"), "w", encoding="utf-8").write("\n".join(lines))
           PY
           }
@@ -148,6 +155,13 @@ jobs:
           set -e
           python opportunity.py run --top "$RTDB_OPP_TOP"
           bash ./publish_reports.sh opportunities
+
+      - name: game idea agent
+        if: github.event.schedule == '0 16 * * 1' || inputs.job == 'ideas'
+        run: |
+          set -e
+          python ideas.py generate --archetypes "$RTDB_IDEAS_ARCHETYPES" --per "$RTDB_IDEAS_PER"
+          bash ./publish_reports.sh concepts
 
       - name: remove reports from this (public) repository
         if: inputs.job == 'purge-public-reports'
