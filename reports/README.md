@@ -2,9 +2,11 @@
 
 Newest first. Opportunity reports are design briefs for the best-scoring archetypes; radar reports are daily briefs on games that ignited.
 
+**[Concepts log — every concept the idea agent has proposed, with status](concepts_log.md)**
+
 ## Concepts (idea agent)
 
-- none yet
+- [concepts-2026-10-05.md](concepts-2026-10-05.md)
 
 ## Opportunities
 
