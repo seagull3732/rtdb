@@ -10,6 +10,7 @@ Newest first. Opportunity reports are design briefs for the best-scoring archety
 
 ## Opportunities
 
+- [opportunities-2026-10-12.md](opportunities-2026-10-12.md)
 - [opportunities-2026-10-05.md](opportunities-2026-10-05.md)
 - [opportunities-2026-10-02.md](opportunities-2026-10-02.md)
 - [opportunities-2026-10-01.md](opportunities-2026-10-01.md)
