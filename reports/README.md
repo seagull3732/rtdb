@@ -6,6 +6,7 @@ Newest first. Opportunity reports are design briefs for the best-scoring archety
 
 ## Concepts (idea agent)
 
+- [concepts-2026-10-12.md](concepts-2026-10-12.md)
 - [concepts-2026-10-05.md](concepts-2026-10-05.md)
 
 ## Opportunities
