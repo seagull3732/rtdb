@@ -18,6 +18,7 @@ Newest first. Opportunity reports are design briefs for the best-scoring archety
 
 ## Radar
 
+- [radar-2026-10-15.md](radar-2026-10-15.md)
 - [radar-2026-10-14.md](radar-2026-10-14.md)
 - [radar-2026-10-13.md](radar-2026-10-13.md)
 - [radar-2026-10-12.md](radar-2026-10-12.md)
